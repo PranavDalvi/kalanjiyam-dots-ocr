@@ -1,0 +1,27 @@
+version: "3.8"
+
+services:
+  dotsocr-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dotsocr-fastapi-service:latest
+    container_name: dotsocr_api_service
+    restart: unless-stopped
+    network_mode: "host"
+    environment:
+      - MODEL_PATH=${HOST_MODEL_PATH:-rednote-hilab/dots.ocr}
+      - MAX_CONCURRENT_REQUESTS=2
+      - IDLE_TIMEOUT_SECONDS=1800
+      - FASTAPI_PORT=8887
+      - VLLM_PORT=8000
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+      - .:/workspace
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

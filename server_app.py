@@ -22,14 +22,23 @@ app = FastAPI(
 
 # Configuration defaults
 IDLE_TIMEOUT_SECONDS = int(os.getenv("IDLE_TIMEOUT_SECONDS", "1800"))  # 30 minutes
-MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "2")) # Concurrency limit (default: 2)
+# API admission and engine batching must be controlled independently.  Increasing
+# vLLM's sequence count can lower OCR decode throughput on a single A6000, while
+# allowing several HTTP requests to wait for the engine remains useful.
+API_MAX_CONCURRENT_REQUESTS = int(
+    os.getenv("API_MAX_CONCURRENT_REQUESTS", os.getenv("MAX_CONCURRENT_REQUESTS", "8"))
+)
+VLLM_MAX_NUM_SEQS = int(os.getenv("VLLM_MAX_NUM_SEQS", "1"))
+VLLM_MAX_NUM_BATCHED_TOKENS = os.getenv("VLLM_MAX_NUM_BATCHED_TOKENS")
+GPU_MEMORY_UTILIZATION = float(os.getenv("GPU_MEMORY_UTILIZATION", "0.90"))
+GPU_COUNT = int(os.getenv("GPU_COUNT", "1"))
 VLLM_PORT = int(os.getenv("VLLM_PORT", "8000"))
 VLLM_BASE_URL = f"http://localhost:{VLLM_PORT}/v1/chat/completions"
 MODEL_PATH = os.getenv("MODEL_PATH", "rednote-hilab/dots.ocr")
 MODEL_NAME = "model"
 
 # Asyncio Semaphore to restrict maximum parallel in-flight OCR requests at API level
-request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+request_semaphore = asyncio.Semaphore(API_MAX_CONCURRENT_REQUESTS)
 
 DOTSOCR_PROMPT = """please output the layout information from the pdf image, including each layout element's bbox, its category, and the corresponding text content within the bbox.
 
@@ -266,7 +275,7 @@ def get_gpu_info() -> list[dict]:
         return []
 
 
-def select_best_gpu() -> tuple[int, float]:
+def select_best_gpu(excluded_gpu_ids: set[int] | None = None) -> tuple[int, float]:
     """
     Select the GPU index with the most free VRAM and dynamically calculate a safe GPU memory utilization ratio.
     """
@@ -274,7 +283,13 @@ def select_best_gpu() -> tuple[int, float]:
     if not gpus:
         raise RuntimeError("No NVIDIA GPUs detected on server!")
 
-    sorted_gpus = sorted(gpus, key=lambda g: g["free_mb"], reverse=True)
+    excluded_gpu_ids = excluded_gpu_ids or set()
+    sorted_gpus = sorted(
+        (gpu for gpu in gpus if gpu["index"] not in excluded_gpu_ids),
+        key=lambda g: g["free_mb"], reverse=True,
+    )
+    if not sorted_gpus:
+        raise RuntimeError("Not enough distinct NVIDIA GPUs available for GPU_COUNT.")
     best_gpu = sorted_gpus[0]
 
     total_mb = best_gpu["total_mb"]
@@ -283,142 +298,145 @@ def select_best_gpu() -> tuple[int, float]:
     if free_mb < 4000:
         raise RuntimeError(f"GPU {best_gpu['index']} has only {free_mb} MB free VRAM. Minimum 4GB required for DotsOCR.")
 
-    calculated_util = (free_mb / total_mb) * 0.90
-    safe_utilization = round(max(0.25, min(0.85, calculated_util)), 2)
+    calculated_util = (free_mb / total_mb) * GPU_MEMORY_UTILIZATION
+    safe_utilization = round(max(0.25, min(GPU_MEMORY_UTILIZATION, calculated_util)), 2)
 
     log("GPU SELECT", f"Picked GPU {best_gpu['index']} ({free_mb} MB free / {total_mb} MB total). Dynamic GPU utilization set to {safe_utilization} (~{int(total_mb * safe_utilization)} MB).")
     return best_gpu["index"], safe_utilization
 
 
 class GPUProcessManager:
-    """Manages lifecycle of vLLM backend: auto-start, health checks, and 30-min idle auto-shutdown."""
+    """Runs one single-GPU vLLM worker per selected GPU and routes requests round-robin."""
 
     def __init__(self):
-        self.process = None
-        self.active_gpu = None
+        self.backends = []
+        self.next_backend_index = 0
         self.last_active_timestamp = time.time()
         self.lock = threading.Lock()
         self.monitor_thread = threading.Thread(target=self._idle_monitor, daemon=True)
         self.monitor_thread.start()
 
+    @property
+    def active_gpus(self):
+        return [backend["gpu_idx"] for backend in self._healthy_backends()]
+
     def touch(self):
-        """Update last active timestamp on incoming requests."""
         self.last_active_timestamp = time.time()
 
-    def is_running(self) -> bool:
-        """Check if vLLM backend is active and responding to health check."""
-        if self.process and self.process.poll() is None:
-            try:
-                resp = requests.get(f"http://localhost:{VLLM_PORT}/v1/models", timeout=2)
-                return resp.status_code == 200
-            except Exception:
-                return False
-        return False
+    @staticmethod
+    def _is_backend_running(backend) -> bool:
+        if backend["process"].poll() is not None:
+            return False
+        try:
+            response = requests.get(f"http://localhost:{backend['port']}/v1/models", timeout=2)
+            return response.status_code == 200
+        except Exception:
+            return False
 
-    def _stream_logs(self, proc):
-        """Continuously read vLLM subprocess stdout line-by-line to prevent pipe buffer deadlock."""
+    def _healthy_backends(self):
+        """Return only live workers; one failed GPU must not take down the others."""
+        return [backend for backend in self.backends if self._is_backend_running(backend)]
+
+    def is_running(self) -> bool:
+        return bool(self._healthy_backends())
+
+    def _next_backend(self):
+        healthy_backends = self._healthy_backends()
+        if not healthy_backends:
+            raise RuntimeError("No healthy vLLM workers are available.")
+        backend = healthy_backends[self.next_backend_index % len(healthy_backends)]
+        self.next_backend_index = (self.next_backend_index + 1) % len(healthy_backends)
+        return backend
+
+    @staticmethod
+    def _stream_logs(proc, gpu_idx):
         for line in iter(proc.stdout.readline, ""):
             if not line:
                 break
-            print(f"[vLLM] {line.strip()}", flush=True)
+            print(f"[vLLM GPU {gpu_idx}] {line.strip()}", flush=True)
 
-    def start_backend(self) -> int:
-        """Start vLLM process on the GPU with the most free VRAM if not running."""
+    def _stop_backends(self):
+        for backend in self.backends:
+            proc = backend["process"]
+            log("VRAM CLEANUP", f"Stopping vLLM process on GPU {backend['gpu_idx']}...")
+            try:
+                if os.name != "nt":
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                else:
+                    proc.kill()
+            except Exception as e:
+                log("VRAM WARN", f"Error stopping GPU {backend['gpu_idx']}: {e}")
+        self.backends = []
+        self.next_backend_index = 0
+
+    def start_backend(self):
+        """Start GPU_COUNT independent single-GPU workers and return one for this request."""
         with self.lock:
+            # Do not restart healthy models merely because another GPU failed.
             if self.is_running():
-                return self.active_gpu
+                return self._next_backend()
 
-            # Ensure model is downloaded locally and config.json has auto_map
+            if self.backends:
+                self._stop_backends()
             effective_model_path = ensure_model_downloaded()
-
-            log("BACKEND START", "Model backend is offline. Auto-selecting best GPU...")
-            gpu_idx, safe_utilization = select_best_gpu()
-            self.active_gpu = gpu_idx
-
-            log("BACKEND LAUNCH", f"Launching vLLM process on GPU {gpu_idx} (Path: {effective_model_path}, Memory Util: {safe_utilization})...")
-
-            # Build PYTHONPATH: include model dir AND its parent so:
-            # - transformers can resolve auto_map entries
-            # - DotsOCR package imports work (from DotsOCR.modeling_dots_ocr_vllm)
             model_parent = os.path.dirname(effective_model_path)
             extra_paths = [effective_model_path, model_parent, "/workspace", "/root/.cache/weights"]
             pythonpath_str = ":".join(extra_paths) + ":" + os.environ.get("PYTHONPATH", "")
+            selected_gpu_ids = set()
 
-            env = os.environ.copy()
-            env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
-            env["VLLM_USE_V1"] = "0"
-            env["PYTHONPATH"] = pythonpath_str
+            for worker_index in range(GPU_COUNT):
+                gpu_idx, safe_utilization = select_best_gpu(selected_gpu_ids)
+                selected_gpu_ids.add(gpu_idx)
+                port = VLLM_PORT + worker_index
+                env = os.environ.copy()
+                env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
+                env["VLLM_USE_V1"] = "0"
+                env["PYTHONPATH"] = pythonpath_str
+                cmd = [
+                    "vllm", "serve", effective_model_path,
+                    "--tensor-parallel-size", "1",
+                    "--gpu-memory-utilization", str(safe_utilization),
+                    "--max-num-seqs", str(VLLM_MAX_NUM_SEQS),
+                    "--trust-remote-code",
+                    "--served-model-name", MODEL_NAME,
+                    "--port", str(port),
+                ]
+                if VLLM_MAX_NUM_BATCHED_TOKENS:
+                    cmd.extend(["--max-num-batched-tokens", VLLM_MAX_NUM_BATCHED_TOKENS])
+                log("BACKEND LAUNCH", f"Launching worker {worker_index + 1}/{GPU_COUNT} on GPU {gpu_idx}, port {port}, memory target {safe_utilization}.")
+                proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, preexec_fn=os.setsid if os.name != "nt" else None)
+                backend = {"gpu_idx": gpu_idx, "port": port, "process": proc}
+                threading.Thread(target=self._stream_logs, args=(proc, gpu_idx), daemon=True).start()
 
-            cmd = [
-                "vllm", "serve", effective_model_path,
-                "--tensor-parallel-size", "1",
-                "--gpu-memory-utilization", str(safe_utilization),
-                "--max-num-seqs", str(MAX_CONCURRENT_REQUESTS),
-                "--trust-remote-code",
-                "--served-model-name", MODEL_NAME,
-                "--port", str(VLLM_PORT)
-            ]
+                start_wait = time.time()
+                while time.time() - start_wait < 300:
+                    if self._is_backend_running(backend):
+                        break
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(3)
+                if not self._is_backend_running(backend):
+                    log("BACKEND WARN", f"GPU {gpu_idx} worker did not start. Keeping existing workers online and continuing with the remaining GPUs.")
+                    continue
+                self.backends.append(backend)
+                log("BACKEND READY", f"vLLM worker is ready on GPU {gpu_idx}.")
 
-            self.process = subprocess.Popen(
-                cmd,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                preexec_fn=os.setsid if os.name != "nt" else None
-            )
-
-            log_reader = threading.Thread(target=self._stream_logs, args=(self.process,), daemon=True)
-            log_reader.start()
-
-            log("BACKEND WAIT", "Loading model weights into GPU VRAM (streaming vLLM output below)...")
-            start_wait = time.time()
-            ready = False
-
-            while time.time() - start_wait < 300:
-                if self.is_running():
-                    ready = True
-                    break
-                if self.process.poll() is not None:
-                    log("BACKEND ERROR", f"vLLM process exited unexpectedly with code {self.process.poll()}")
-                    break
-                time.sleep(3)
-
-            if not ready:
-                self.stop_backend()
-                raise RuntimeError("Failed to start vLLM backend within 300 seconds. Check vLLM log output above.")
-
-            log("BACKEND READY", f"vLLM model backend is ONLINE and READY on GPU {gpu_idx}!")
+            if not self.backends:
+                raise RuntimeError("No vLLM worker could start. Check the worker logs above.")
             self.touch()
-            return gpu_idx
+            return self._next_backend()
 
     def stop_backend(self):
-        """Stop vLLM backend and free 100% VRAM."""
         with self.lock:
-            if self.process:
-                log("VRAM CLEANUP", f"Stopping vLLM process on GPU {self.active_gpu} to free 100% VRAM...")
-                try:
-                    if os.name != "nt":
-                        os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
-                    else:
-                        self.process.kill()
-                except Exception as e:
-                    log("VRAM WARN", f"Error stopping process: {e}")
-
-                self.process = None
-                self.active_gpu = None
-                log("VRAM FREED", "Backend stopped successfully. GPU VRAM is completely free.")
+            self._stop_backends()
+            log("VRAM FREED", "All vLLM workers stopped; their VRAM has been released.")
 
     def _idle_monitor(self):
-        """Background thread checking for 30-minute idle timeout."""
         while True:
             time.sleep(30)
-            if self.process and self.process.poll() is None:
-                idle_time = time.time() - self.last_active_timestamp
-                if idle_time > IDLE_TIMEOUT_SECONDS:
-                    log("IDLE TIMEOUT", f"No requests for {int(idle_time)}s (limit: {IDLE_TIMEOUT_SECONDS}s). Triggering auto-shutdown...")
-                    self.stop_backend()
+            if self.backends and time.time() - self.last_active_timestamp > IDLE_TIMEOUT_SECONDS:
+                log("IDLE TIMEOUT", f"No requests for {int(time.time() - self.last_active_timestamp)}s (limit: {IDLE_TIMEOUT_SECONDS}s). Triggering auto-shutdown...")
+                self.stop_backend()
 
 
 gpu_manager = GPUProcessManager()
@@ -449,9 +467,11 @@ def gpu_status():
     return {
         "gpu_present": len(gpus) > 0,
         "gpu_count": len(gpus),
-        "active_gpu": gpu_manager.active_gpu,
+        "active_gpus": gpu_manager.active_gpus,
+        "gpu_count_configured": GPU_COUNT,
         "backend_running": gpu_manager.is_running(),
-        "max_concurrent_limit": MAX_CONCURRENT_REQUESTS,
+        "api_max_concurrent_limit": API_MAX_CONCURRENT_REQUESTS,
+        "vllm_max_num_seqs": VLLM_MAX_NUM_SEQS,
         "idle_seconds": round(time.time() - gpu_manager.last_active_timestamp, 1),
         "idle_timeout_seconds": IDLE_TIMEOUT_SECONDS,
         "gpus": gpus
@@ -464,8 +484,10 @@ def health_check():
     return {
         "status": "healthy",
         "backend_running": gpu_manager.is_running(),
-        "active_gpu": gpu_manager.active_gpu,
-        "max_concurrent_limit": MAX_CONCURRENT_REQUESTS
+        "active_gpus": gpu_manager.active_gpus,
+        "gpu_count_configured": GPU_COUNT,
+        "api_max_concurrent_limit": API_MAX_CONCURRENT_REQUESTS,
+        "vllm_max_num_seqs": VLLM_MAX_NUM_SEQS
     }
 
 
@@ -494,7 +516,7 @@ async def run_ocr(
     async with request_semaphore:
         gpu_manager.touch()
         try:
-            active_gpu = gpu_manager.start_backend()
+            backend = gpu_manager.start_backend()
         except Exception as e:
             log("REQ ERROR", f"GPU initialization failed: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Failed to initialize GPU model backend: {str(e)}")
@@ -512,6 +534,8 @@ async def run_ocr(
 
         start_time = time.perf_counter()
 
+        active_gpu = backend["gpu_idx"]
+        backend_url = f"http://localhost:{backend['port']}/v1/chat/completions"
         log("INFERENCE START", f"Sending vision request for '{filename}' to vLLM engine on GPU {active_gpu}...")
 
         payload = {
@@ -530,7 +554,11 @@ async def run_ocr(
         }
 
         try:
-            response = requests.post(VLLM_BASE_URL, json=payload, timeout=180)
+            # requests is synchronous; running it in a worker thread keeps the
+            # FastAPI event loop free to accept and queue other OCR requests.
+            response = await asyncio.to_thread(
+                requests.post, backend_url, json=payload, timeout=180
+            )
             if response.status_code != 200:
                 log("REQ ERROR", f"vLLM backend returned status code {response.status_code}: {response.text}")
                 raise HTTPException(status_code=response.status_code, detail=f"vLLM server error: {response.text}")

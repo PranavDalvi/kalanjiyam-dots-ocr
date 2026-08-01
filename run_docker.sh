@@ -28,6 +28,7 @@ case "$ACTION" in
   start)
     echo "[Docker Manager] Building and starting DotsOCR container..."
     echo "[Docker Manager] Model Path/Repo: $MODEL_HOST_PATH"
+    echo "[Docker Manager] GPUs: ${GPU_COUNT:-1} | API queue: ${API_MAX_CONCURRENT_REQUESTS:-8} | vLLM base port: ${VLLM_PORT:-8000} | vLLM sequences/GPU: ${VLLM_MAX_NUM_SEQS:-1} | GPU memory target: ${GPU_MEMORY_UTILIZATION:-0.90}"
     export HOST_MODEL_PATH="$MODEL_HOST_PATH"
     $COMPOSE_CMD up -d --build
     echo "[Docker Manager] Container started! Endpoint available at http://localhost:8887/ocr"
@@ -55,6 +56,16 @@ case "$ACTION" in
     echo "  bash run_docker.sh logs"
     echo "  bash run_docker.sh status"
     echo "  bash run_docker.sh [CUSTOM_MODEL_PATH] start"
+    echo ""
+    echo "Performance tuning examples:"
+    echo "  # Recommended A6000 baseline: queue callers, execute one OCR generation"
+    echo "  API_MAX_CONCURRENT_REQUESTS=8 VLLM_MAX_NUM_SEQS=1 bash run_docker.sh start"
+    echo "  # Use all four A6000 GPUs (four independent, single-sequence workers)"
+    echo "  GPU_COUNT=4 API_MAX_CONCURRENT_REQUESTS=4 VLLM_MAX_NUM_SEQS=1 bash run_docker.sh start"
+    echo "  # Use a different internal vLLM port range if 8000-8003 is occupied"
+    echo "  VLLM_PORT=18000 GPU_COUNT=4 API_MAX_CONCURRENT_REQUESTS=4 bash run_docker.sh start"
+    echo "  # Controlled scheduler experiment"
+    echo "  VLLM_MAX_NUM_BATCHED_TOKENS=8192 bash run_docker.sh start"
     exit 1
     ;;
 esac

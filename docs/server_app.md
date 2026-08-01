@@ -33,6 +33,32 @@ cd /home/ganesh/kalanjiyam-dotsocr
 bash run_docker.sh start
 ```
 
+### A6000 performance settings
+
+The default starts an API queue of eight requests but restricts the vLLM engine
+to one active OCR sequence. This keeps the single-page generation path fast on
+the A6000 while accepting bursts of work.
+
+```bash
+# Default recommended A6000 configuration
+API_MAX_CONCURRENT_REQUESTS=8 VLLM_MAX_NUM_SEQS=1 bash run_docker.sh start
+
+# Use all four A6000 GPUs. Each GPU runs one independent fast OCR worker.
+GPU_COUNT=4 API_MAX_CONCURRENT_REQUESTS=4 VLLM_MAX_NUM_SEQS=1 bash run_docker.sh start
+
+# If another application owns ports 8000-8003, use a dedicated internal range.
+VLLM_PORT=18000 GPU_COUNT=4 API_MAX_CONCURRENT_REQUESTS=4 bash run_docker.sh start
+
+# Optional controlled scheduler experiment; compare total pages/minute and p95 latency.
+VLLM_MAX_NUM_BATCHED_TOKENS=8192 bash run_docker.sh start
+```
+
+Do not increase `VLLM_MAX_NUM_SEQS` if it reduces total pages/minute. It changes
+the number of active model generations, not merely the size of the HTTP queue.
+`GPU_COUNT` instead increases throughput by placing one request on each GPU.
+Use an API concurrency equal to the GPU count when the client already has a
+bounded Celery queue; it avoids building a second, unordered queue in the API.
+
 ---
 
 ## API Endpoints Reference

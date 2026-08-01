@@ -17,12 +17,16 @@ COPY server_app.py /workspace/server_app.py
 COPY patch.sh /workspace/patch.sh
 COPY instruction_prompts.yml /workspace/instruction_prompts.yml
 
-# Apply vLLM patch inside container
-RUN bash /workspace/patch.sh || true
+# Validate the patch script during the image build. The model itself is downloaded
+# at runtime, so the script correctly reports that no local config exists yet.
+RUN bash /workspace/patch.sh
 
 # Environment defaults
 ENV MODEL_PATH=rednote-hilab/dots.ocr
-ENV MAX_CONCURRENT_REQUESTS=2
+ENV API_MAX_CONCURRENT_REQUESTS=8
+ENV VLLM_MAX_NUM_SEQS=1
+ENV GPU_MEMORY_UTILIZATION=0.90
+ENV GPU_COUNT=1
 ENV IDLE_TIMEOUT_SECONDS=1800
 ENV FASTAPI_PORT=8887
 ENV VLLM_PORT=8000

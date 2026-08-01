@@ -43,21 +43,37 @@ the A6000 while accepting bursts of work.
 # Default recommended A6000 configuration
 API_MAX_CONCURRENT_REQUESTS=8 VLLM_MAX_NUM_SEQS=1 bash run_docker.sh start
 
-# Use all four A6000 GPUs. Each GPU runs one independent fast OCR worker.
-GPU_COUNT=4 API_MAX_CONCURRENT_REQUESTS=4 VLLM_MAX_NUM_SEQS=1 bash run_docker.sh start
-
-# If another application owns ports 8000-8003, use a dedicated internal range.
-VLLM_PORT=18000 GPU_COUNT=4 API_MAX_CONCURRENT_REQUESTS=4 bash run_docker.sh start
-
 # Optional controlled scheduler experiment; compare total pages/minute and p95 latency.
 VLLM_MAX_NUM_BATCHED_TOKENS=8192 bash run_docker.sh start
 ```
 
 Do not increase `VLLM_MAX_NUM_SEQS` if it reduces total pages/minute. It changes
 the number of active model generations, not merely the size of the HTTP queue.
-`GPU_COUNT` instead increases throughput by placing one request on each GPU.
-Use an API concurrency equal to the GPU count when the client already has a
-bounded Celery queue; it avoids building a second, unordered queue in the API.
+
+### Safe four-GPU deployment (same client API)
+
+Use the dedicated multi-GPU deployment rather than `GPU_COUNT=4` in one API
+container. It starts one pinned worker per GPU and a router that preserves the
+existing `http://<host>:8887/ocr` API URL.
+
+```bash
+# Stop the single-GPU service first, then start the isolated workers and router.
+bash run_docker.sh stop
+bash run_docker.sh start-multi
+bash run_docker.sh status-multi
+```
+
+The workers use API ports `18887` through `18890` and vLLM ports `18000`
+through `18003`; only the HAProxy router exposes port `8887` to the client.
+An unhealthy worker is removed from routing without restarting the others.
+
+Each worker checks `MIN_FREE_VRAM_MB` before loading the model (default:
+`36000`, roughly 35 GB). If another workload leaves insufficient VRAM on a
+GPU, that worker responds unhealthy and HAProxy skips it. The check runs again
+after an idle unload and before every subsequent model load. Override it only
+when necessary, for example: `MIN_FREE_VRAM_MB=38000 bash run_docker.sh start-multi`.
+vLLM retains a separate 1 GB driver/allocation reserve by default; change it
+with `GPU_MEMORY_HEADROOM_MB` only if your host requires more headroom.
 
 ---
 

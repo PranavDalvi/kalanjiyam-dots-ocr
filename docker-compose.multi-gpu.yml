@@ -1,0 +1,89 @@
+services:
+  dotsocr-gpu0:
+    build: { context: ., dockerfile: Dockerfile }
+    image: dotsocr-fastapi-service:latest
+    container_name: dotsocr_gpu0
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - MODEL_PATH=${HOST_MODEL_PATH:-rednote-hilab/dots.ocr}
+      - PINNED_GPU_ID=0
+      - GPU_COUNT=1
+      - API_MAX_CONCURRENT_REQUESTS=1
+      - VLLM_MAX_NUM_SEQS=1
+      - GPU_MEMORY_UTILIZATION=0.90
+      - MIN_FREE_VRAM_MB=${MIN_FREE_VRAM_MB:-36000}
+      - GPU_MEMORY_HEADROOM_MB=${GPU_MEMORY_HEADROOM_MB:-1024}
+      - FASTAPI_PORT=18887
+      - VLLM_PORT=18000
+      - IDLE_TIMEOUT_SECONDS=1800
+    volumes: [~/.cache/huggingface:/root/.cache/huggingface, .:/workspace]
+    deploy: { resources: { reservations: { devices: [{driver: nvidia, count: all, capabilities: [gpu]}] } } }
+
+  dotsocr-gpu1:
+    image: dotsocr-fastapi-service:latest
+    container_name: dotsocr_gpu1
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - MODEL_PATH=${HOST_MODEL_PATH:-rednote-hilab/dots.ocr}
+      - PINNED_GPU_ID=1
+      - GPU_COUNT=1
+      - API_MAX_CONCURRENT_REQUESTS=1
+      - VLLM_MAX_NUM_SEQS=1
+      - GPU_MEMORY_UTILIZATION=0.90
+      - MIN_FREE_VRAM_MB=${MIN_FREE_VRAM_MB:-36000}
+      - GPU_MEMORY_HEADROOM_MB=${GPU_MEMORY_HEADROOM_MB:-1024}
+      - FASTAPI_PORT=18888
+      - VLLM_PORT=18001
+      - IDLE_TIMEOUT_SECONDS=1800
+    volumes: [~/.cache/huggingface:/root/.cache/huggingface, .:/workspace]
+    deploy: { resources: { reservations: { devices: [{driver: nvidia, count: all, capabilities: [gpu]}] } } }
+
+  dotsocr-gpu2:
+    image: dotsocr-fastapi-service:latest
+    container_name: dotsocr_gpu2
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - MODEL_PATH=${HOST_MODEL_PATH:-rednote-hilab/dots.ocr}
+      - PINNED_GPU_ID=2
+      - GPU_COUNT=1
+      - API_MAX_CONCURRENT_REQUESTS=1
+      - VLLM_MAX_NUM_SEQS=1
+      - GPU_MEMORY_UTILIZATION=0.90
+      - MIN_FREE_VRAM_MB=${MIN_FREE_VRAM_MB:-36000}
+      - GPU_MEMORY_HEADROOM_MB=${GPU_MEMORY_HEADROOM_MB:-1024}
+      - FASTAPI_PORT=18889
+      - VLLM_PORT=18002
+      - IDLE_TIMEOUT_SECONDS=1800
+    volumes: [~/.cache/huggingface:/root/.cache/huggingface, .:/workspace]
+    deploy: { resources: { reservations: { devices: [{driver: nvidia, count: all, capabilities: [gpu]}] } } }
+
+  dotsocr-gpu3:
+    image: dotsocr-fastapi-service:latest
+    container_name: dotsocr_gpu3
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - MODEL_PATH=${HOST_MODEL_PATH:-rednote-hilab/dots.ocr}
+      - PINNED_GPU_ID=3
+      - GPU_COUNT=1
+      - API_MAX_CONCURRENT_REQUESTS=1
+      - VLLM_MAX_NUM_SEQS=1
+      - GPU_MEMORY_UTILIZATION=0.90
+      - MIN_FREE_VRAM_MB=${MIN_FREE_VRAM_MB:-36000}
+      - GPU_MEMORY_HEADROOM_MB=${GPU_MEMORY_HEADROOM_MB:-1024}
+      - FASTAPI_PORT=18890
+      - VLLM_PORT=18003
+      - IDLE_TIMEOUT_SECONDS=1800
+    volumes: [~/.cache/huggingface:/root/.cache/huggingface, .:/workspace]
+    deploy: { resources: { reservations: { devices: [{driver: nvidia, count: all, capabilities: [gpu]}] } } }
+
+  dotsocr-router:
+    image: haproxy:2.9-alpine
+    container_name: dotsocr_router
+    restart: unless-stopped
+    network_mode: host
+    depends_on: [dotsocr-gpu0, dotsocr-gpu1, dotsocr-gpu2, dotsocr-gpu3]
+    volumes: [./haproxy-dotsocr.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro]

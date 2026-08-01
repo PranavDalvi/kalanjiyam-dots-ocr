@@ -12,6 +12,7 @@ from typing import Optional
 import requests
 import io
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi.responses import JSONResponse
 from PIL import Image
 
 app = FastAPI(
@@ -32,6 +33,9 @@ VLLM_MAX_NUM_SEQS = int(os.getenv("VLLM_MAX_NUM_SEQS", "1"))
 VLLM_MAX_NUM_BATCHED_TOKENS = os.getenv("VLLM_MAX_NUM_BATCHED_TOKENS")
 GPU_MEMORY_UTILIZATION = float(os.getenv("GPU_MEMORY_UTILIZATION", "0.90"))
 GPU_COUNT = int(os.getenv("GPU_COUNT", "1"))
+PINNED_GPU_ID = os.getenv("PINNED_GPU_ID")
+MIN_FREE_VRAM_MB = int(os.getenv("MIN_FREE_VRAM_MB", "36000"))
+GPU_MEMORY_HEADROOM_MB = int(os.getenv("GPU_MEMORY_HEADROOM_MB", "1024"))
 VLLM_PORT = int(os.getenv("VLLM_PORT", "8000"))
 VLLM_BASE_URL = f"http://localhost:{VLLM_PORT}/v1/chat/completions"
 MODEL_PATH = os.getenv("MODEL_PATH", "rednote-hilab/dots.ocr")
@@ -275,7 +279,7 @@ def get_gpu_info() -> list[dict]:
         return []
 
 
-def select_best_gpu(excluded_gpu_ids: set[int] | None = None) -> tuple[int, float]:
+def select_best_gpu(excluded_gpu_ids: set[int] | None = None, log_selection: bool = True) -> tuple[int, float]:
     """
     Select the GPU index with the most free VRAM and dynamically calculate a safe GPU memory utilization ratio.
     """
@@ -284,24 +288,37 @@ def select_best_gpu(excluded_gpu_ids: set[int] | None = None) -> tuple[int, floa
         raise RuntimeError("No NVIDIA GPUs detected on server!")
 
     excluded_gpu_ids = excluded_gpu_ids or set()
-    sorted_gpus = sorted(
-        (gpu for gpu in gpus if gpu["index"] not in excluded_gpu_ids),
-        key=lambda g: g["free_mb"], reverse=True,
-    )
-    if not sorted_gpus:
-        raise RuntimeError("Not enough distinct NVIDIA GPUs available for GPU_COUNT.")
-    best_gpu = sorted_gpus[0]
+    if PINNED_GPU_ID is not None:
+        pinned_gpu_id = int(PINNED_GPU_ID)
+        if pinned_gpu_id in excluded_gpu_ids:
+            raise RuntimeError(f"Pinned GPU {pinned_gpu_id} was selected more than once.")
+        sorted_gpus = [gpu for gpu in gpus if gpu["index"] == pinned_gpu_id]
+        if not sorted_gpus:
+            raise RuntimeError(f"Configured PINNED_GPU_ID={pinned_gpu_id} is not available.")
+    else:
+        sorted_gpus = sorted(
+            (gpu for gpu in gpus if gpu["index"] not in excluded_gpu_ids),
+            key=lambda g: g["free_mb"], reverse=True,
+        )
+    eligible_gpus = [gpu for gpu in sorted_gpus if gpu["free_mb"] >= MIN_FREE_VRAM_MB]
+    if not eligible_gpus:
+        gpu_description = f"GPU {PINNED_GPU_ID}" if PINNED_GPU_ID is not None else "any eligible GPU"
+        raise RuntimeError(
+            f"No {gpu_description} has the required {MIN_FREE_VRAM_MB} MB free VRAM to load DotsOCR."
+        )
+    best_gpu = eligible_gpus[0]
 
     total_mb = best_gpu["total_mb"]
     free_mb = best_gpu["free_mb"]
 
-    if free_mb < 4000:
-        raise RuntimeError(f"GPU {best_gpu['index']} has only {free_mb} MB free VRAM. Minimum 4GB required for DotsOCR.")
-
-    calculated_util = (free_mb / total_mb) * GPU_MEMORY_UTILIZATION
+    # Translate currently free VRAM into vLLM's total-GPU fraction while keeping
+    # a small allocation/driver reserve. This avoids wasting 10% of already
+    # limited free VRAM on otherwise eligible GPUs.
+    calculated_util = (free_mb - GPU_MEMORY_HEADROOM_MB) / total_mb
     safe_utilization = round(max(0.25, min(GPU_MEMORY_UTILIZATION, calculated_util)), 2)
 
-    log("GPU SELECT", f"Picked GPU {best_gpu['index']} ({free_mb} MB free / {total_mb} MB total). Dynamic GPU utilization set to {safe_utilization} (~{int(total_mb * safe_utilization)} MB).")
+    if log_selection:
+        log("GPU SELECT", f"Picked GPU {best_gpu['index']} ({free_mb} MB free / {total_mb} MB total). Dynamic GPU utilization set to {safe_utilization} (~{int(total_mb * safe_utilization)} MB).")
     return best_gpu["index"], safe_utilization
 
 
@@ -339,6 +356,16 @@ class GPUProcessManager:
 
     def is_running(self) -> bool:
         return bool(self._healthy_backends())
+
+    def is_available(self) -> bool:
+        """A healthy loaded worker or enough free VRAM to load one on demand."""
+        if self.is_running():
+            return True
+        try:
+            select_best_gpu(log_selection=False)
+            return True
+        except RuntimeError:
+            return False
 
     def _next_backend(self):
         healthy_backends = self._healthy_backends()
@@ -481,14 +508,17 @@ def gpu_status():
 @app.get("/health")
 def health_check():
     """Health check endpoint."""
-    return {
-        "status": "healthy",
+    available = gpu_manager.is_available()
+    payload = {
+        "status": "healthy" if available else "unavailable",
         "backend_running": gpu_manager.is_running(),
         "active_gpus": gpu_manager.active_gpus,
         "gpu_count_configured": GPU_COUNT,
         "api_max_concurrent_limit": API_MAX_CONCURRENT_REQUESTS,
-        "vllm_max_num_seqs": VLLM_MAX_NUM_SEQS
+        "vllm_max_num_seqs": VLLM_MAX_NUM_SEQS,
+        "min_free_vram_mb": MIN_FREE_VRAM_MB,
     }
+    return JSONResponse(status_code=200 if available else 503, content=payload)
 
 
 @app.post("/ocr")

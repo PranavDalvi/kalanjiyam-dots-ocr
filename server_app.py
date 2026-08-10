@@ -473,6 +473,21 @@ gpu_manager = GPUProcessManager()
 # FASTAPI ENDPOINTS
 # =============================================================================
 
+CATEGORY_MAP = {
+    "title": "heading",
+    "section-header": "subheading",
+    "text": "paragraph",
+    "list-item": "paragraph",
+    "formula": "equation",
+    "table": "table",
+    "picture": "figure",
+    "caption": "caption",
+    "footnote": "footnote",
+    "page-header": "running-header",
+    "page-footer": "page-number",
+}
+
+
 def convert_image_bytes_to_base64_uri(image_bytes: bytes) -> str:
     """Fast conversion of raw image bytes to JPEG base64 Data URI."""
     try:
@@ -485,6 +500,112 @@ def convert_image_bytes_to_base64_uri(image_bytes: bytes) -> str:
         return f"data:image/jpeg;base64,{b64_str}"
     except Exception as err:
         raise ValueError(f"Invalid image format or corrupted image file: {str(err)}")
+
+
+def format_kalanjiyam_v2_response(
+    parsed_layout,
+    image_bytes: bytes,
+    filename: str,
+    active_gpu: int,
+    language: str,
+    duration_seconds: float,
+    prompt_tokens: int,
+    completion_tokens: int,
+    throughput: float,
+) -> dict:
+    """Formats DotsOCR outputs into the Kalanjiyam OCR Service Contract (v2) JSON response."""
+    page_width, page_height = 1000, 1000
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        page_width, page_height = img.size
+    except Exception:
+        pass
+
+    blocks = []
+    tsv_lines = []
+    text_parts = []
+
+    if isinstance(parsed_layout, list):
+        for i, item in enumerate(parsed_layout, 1):
+            if not isinstance(item, dict):
+                continue
+            raw_cat = (item.get("category") or "text").lower().strip()
+            block_type = CATEGORY_MAP.get(raw_cat, "paragraph")
+
+            raw_bbox = item.get("bbox") or [0, 0, 0, 0]
+            if isinstance(raw_bbox, (list, tuple)) and len(raw_bbox) == 4:
+                # DotsOCR outputs coordinates in [0, 1000] normalized scale
+                x1 = round((float(raw_bbox[0]) / 1000.0) * page_width, 2)
+                y1 = round((float(raw_bbox[1]) / 1000.0) * page_height, 2)
+                x2 = round((float(raw_bbox[2]) / 1000.0) * page_width, 2)
+                y2 = round((float(raw_bbox[3]) / 1000.0) * page_height, 2)
+                px_bbox = [x1, y1, x2, y2]
+            else:
+                px_bbox = [0, 0, 0, 0]
+
+            content = str(item.get("text") or "").strip()
+            if content:
+                text_parts.append(content)
+                tsv_lines.append(f"{px_bbox[0]}\t{px_bbox[1]}\t{px_bbox[2]}\t{px_bbox[3]}\t{content}")
+
+            blocks.append({
+                "id": f"b{i}",
+                "type": block_type,
+                "bbox": px_bbox,
+                "reading_order": i,
+                "content": content,
+                "confidence": 0.95,
+                "language": language or "sa"
+            })
+    elif isinstance(parsed_layout, str) and parsed_layout.strip():
+        content = parsed_layout.strip()
+        text_parts.append(content)
+        blocks.append({
+            "id": "b1",
+            "type": "paragraph",
+            "bbox": [0, 0, page_width, page_height],
+            "reading_order": 1,
+            "content": content,
+            "confidence": 0.95,
+            "language": language or "sa"
+        })
+
+    plain_text = "\n\n".join(text_parts)
+    tsv_text = "\n".join(tsv_lines)
+
+    return {
+        # Kalanjiyam OCR Service Contract (v2) fields
+        "contract_version": "2.0",
+        "engine": "dots_ocr",
+        "model": {"name": "dots-ocr", "version": "4.0.0"},
+        "source_type": "scan",
+        "coordinate_space": "pixel",
+        "page_width": page_width,
+        "page_height": page_height,
+        "page_confidence": 0.95,
+        "blocks": blocks,
+        "text": plain_text,
+        "bounding_boxes": tsv_text,
+
+        # Standalone service fields (backwards compatibility)
+        "status": "success",
+        "filename": filename,
+        "gpu_assigned": active_gpu,
+        "results": parsed_layout,
+        "metrics": {
+            "time_taken_seconds": duration_seconds,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+            "generation_speed_tok_per_sec": throughput
+        }
+    }
+
+
+@app.get("/v1/engines")
+def get_engines():
+    """Returns list of active engines for Kalanjiyam service discovery."""
+    return {"engines": ["dots-ocr"]}
 
 
 @app.get("/gpu-status")
@@ -522,13 +643,17 @@ def health_check():
 
 
 @app.post("/ocr")
+@app.post("/v1/ocr")
 async def run_ocr(
     file: Optional[UploadFile] = File(None, description="Image file (PNG, JPG, JPEG, WEBP)"),
     image: Optional[UploadFile] = File(None, description="Alternative field name for image file"),
+    engine: Optional[str] = Form(None, description="OCR engine name"),
+    language: Optional[str] = Form(None, description="Language code (e.g. sa, en, hi)"),
     max_tokens: Optional[int] = Form(None, description="Max generation tokens")
 ):
     """
     Fast image-only OCR endpoint with dynamic GPU VRAM allocation & step-by-step console logging.
+    Supports both standalone API and Kalanjiyam OCR Service Contract (v2).
     """
     target_file = file or image
     if not target_file:
@@ -541,7 +666,7 @@ async def run_ocr(
     eff_max_tokens = max_tokens if (max_tokens is not None and max_tokens > 0) else 4096
 
     filename = target_file.filename or "uploaded_image.jpg"
-    log("REQ RECEIVED", f"Processing image: '{filename}' (max_tokens: {eff_max_tokens})")
+    log("REQ RECEIVED", f"Processing image: '{filename}' (engine: {engine or 'dots-ocr'}, language: {language or 'sa'}, max_tokens: {eff_max_tokens})")
 
     async with request_semaphore:
         gpu_manager.touch()
@@ -617,19 +742,17 @@ async def run_ocr(
 
         log("INFERENCE SUCCESS", f"Finished '{filename}' in {duration_seconds}s | Tokens: {prompt_tokens} in / {completion_tokens} out | Speed: {throughput} tok/s")
 
-        return {
-            "status": "success",
-            "filename": filename,
-            "gpu_assigned": active_gpu,
-            "results": parsed_layout,
-            "metrics": {
-                "time_taken_seconds": duration_seconds,
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-                "generation_speed_tok_per_sec": throughput
-            }
-        }
+        return format_kalanjiyam_v2_response(
+            parsed_layout=parsed_layout,
+            image_bytes=file_bytes,
+            filename=filename,
+            active_gpu=active_gpu,
+            language=language or "sa",
+            duration_seconds=duration_seconds,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            throughput=throughput,
+        )
 
 
 @app.post("/free-vram")

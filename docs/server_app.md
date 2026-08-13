@@ -87,31 +87,46 @@ Processes an uploaded image file (`.png`, `.jpg`, `.jpeg`, `.webp`).
 * **Content-Type**: `multipart/form-data`
 * **Form Field**: `file` (or `image`)
 
-#### Sample Output Response
+#### Sample Output Response (`POST /v1/ocr`) (v2.1 Contract)
 ```json
 {
-  "status": "success",
-  "filename": "page_1.jpg",
-  "gpu_assigned": 0,
-  "results": [
+  "contract_version": "2.1",
+  "engine": "dots_ocr",
+  "model": {
+    "name": "dots-ocr",
+    "version": "4.0.0"
+  },
+  "page_confidence": 0.942,
+  "engine_latency_ms": 342.5,
+  "page_width": 1240,
+  "page_height": 1754,
+  "blocks": [
     {
-      "bbox": [102, 45, 890, 110],
-      "category": "title",
-      "text": "# Financial Report 2026"
+      "id": "b1",
+      "type": "heading",
+      "bbox": [120.0, 40.0, 980.0, 88.0],
+      "reading_order": 1,
+      "content": "Chapter Title Text",
+      "confidence": 0.985,
+      "words": [
+        {"text": "Chapter", "bbox": [120.0, 40.0, 550.0, 88.0], "confidence": 0.985},
+        {"text": "Title", "bbox": [550.0, 40.0, 800.0, 88.0], "confidence": 0.985},
+        {"text": "Text", "bbox": [800.0, 40.0, 980.0, 88.0], "confidence": 0.985}
+      ]
     },
     {
-      "bbox": [102, 130, 890, 650],
-      "category": "text",
-      "text": "Transcribed text content from the image..."
+      "id": "b2",
+      "type": "paragraph",
+      "bbox": [120.0, 100.0, 980.0, 280.0],
+      "reading_order": 2,
+      "content": "First line of body text.\nSecond line of body text.",
+      "confidence": 0.912,
+      "words": [
+        {"text": "First", "bbox": [120.0, 100.0, 270.0, 190.0], "confidence": 0.912},
+        {"text": "line", "bbox": [270.0, 100.0, 420.0, 190.0], "confidence": 0.912}
+      ]
     }
-  ],
-  "metrics": {
-    "time_taken_seconds": 0.2854,
-    "prompt_tokens": 1024,
-    "completion_tokens": 180,
-    "total_tokens": 1204,
-    "generation_speed_tok_per_sec": 630.69
-  }
+  ]
 }
 ```
 

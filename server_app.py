@@ -473,6 +473,12 @@ gpu_manager = GPUProcessManager()
 # FASTAPI ENDPOINTS
 # =============================================================================
 
+ALLOWED_BLOCK_TYPES = {
+    "paragraph", "heading", "subheading", "table", "figure",
+    "caption", "footnote", "running-header", "page-number",
+    "column-header", "equation"
+}
+
 CATEGORY_MAP = {
     "title": "heading",
     "section-header": "subheading",
@@ -485,6 +491,14 @@ CATEGORY_MAP = {
     "footnote": "footnote",
     "page-header": "running-header",
     "page-footer": "page-number",
+    "column-header": "column-header",
+    "heading": "heading",
+    "subheading": "subheading",
+    "paragraph": "paragraph",
+    "equation": "equation",
+    "figure": "figure",
+    "running-header": "running-header",
+    "page-number": "page-number",
 }
 
 
@@ -502,6 +516,56 @@ def convert_image_bytes_to_base64_uri(image_bytes: bytes) -> str:
         raise ValueError(f"Invalid image format or corrupted image file: {str(err)}")
 
 
+def _generate_word_spans(content: str, px_bbox: list[float], block_confidence: float) -> list[dict]:
+    """Generates word span objects with bounding boxes and confidence scores."""
+    if not content:
+        return []
+
+    words_output = []
+    x1, y1, x2, y2 = px_bbox
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+
+    lines = content.splitlines()
+    num_lines = max(1, len(lines))
+    lh = bh / num_lines
+
+    for line_idx, line in enumerate(lines):
+        line_str = line.strip()
+        if not line_str:
+            continue
+        line_top = y1 + line_idx * lh
+        line_bottom = y1 + (line_idx + 1) * lh
+
+        words_in_line = line_str.split()
+        if not words_in_line:
+            continue
+
+        line_char_len = max(1, len(line_str))
+        char_cursor = 0
+        for w_text in words_in_line:
+            w_idx = line_str.find(w_text, char_cursor)
+            if w_idx == -1:
+                w_idx = char_cursor
+            char_cursor = w_idx + len(w_text)
+
+            c_start_ratio = w_idx / line_char_len
+            c_end_ratio = char_cursor / line_char_len
+
+            wx1 = round(x1 + c_start_ratio * bw, 2)
+            wx2 = round(x1 + c_end_ratio * bw, 2)
+            wy1 = round(line_top, 2)
+            wy2 = round(line_bottom, 2)
+
+            words_output.append({
+                "text": w_text,
+                "bbox": [wx1, wy1, wx2, wy2],
+                "confidence": round(float(block_confidence), 3)
+            })
+
+    return words_output
+
+
 def format_kalanjiyam_v2_response(
     parsed_layout,
     image_bytes: bytes,
@@ -512,8 +576,9 @@ def format_kalanjiyam_v2_response(
     prompt_tokens: int,
     completion_tokens: int,
     throughput: float,
+    engine: Optional[str] = None,
 ) -> dict:
-    """Formats DotsOCR outputs into the Kalanjiyam OCR Service Contract (v2) JSON response."""
+    """Formats DotsOCR outputs into the Kalanjiyam OCR Service Contract (v2.1) JSON response."""
     page_width, page_height = 1000, 1000
     try:
         img = Image.open(io.BytesIO(image_bytes))
@@ -524,76 +589,146 @@ def format_kalanjiyam_v2_response(
     blocks = []
     tsv_lines = []
     text_parts = []
+    all_word_confidences = []
 
-    if isinstance(parsed_layout, list):
-        for i, item in enumerate(parsed_layout, 1):
+    layout_items = parsed_layout
+    if isinstance(parsed_layout, dict):
+        if "blocks" in parsed_layout and isinstance(parsed_layout["blocks"], list):
+            layout_items = parsed_layout["blocks"]
+        elif "results" in parsed_layout and isinstance(parsed_layout["results"], list):
+            layout_items = parsed_layout["results"]
+        elif "layout" in parsed_layout and isinstance(parsed_layout["layout"], list):
+            layout_items = parsed_layout["layout"]
+
+    if isinstance(layout_items, list):
+        for i, item in enumerate(layout_items, 1):
             if not isinstance(item, dict):
                 continue
-            raw_cat = (item.get("category") or "text").lower().strip()
-            block_type = CATEGORY_MAP.get(raw_cat, "paragraph")
+            raw_cat = str(item.get("category") or item.get("type") or "text").lower().strip()
+            block_type = CATEGORY_MAP.get(raw_cat)
+            if not block_type:
+                block_type = raw_cat if raw_cat in ALLOWED_BLOCK_TYPES else "paragraph"
 
             raw_bbox = item.get("bbox") or [0, 0, 0, 0]
             if isinstance(raw_bbox, (list, tuple)) and len(raw_bbox) == 4:
-                # DotsOCR outputs coordinates in [0, 1000] normalized scale
-                x1 = round((float(raw_bbox[0]) / 1000.0) * page_width, 2)
-                y1 = round((float(raw_bbox[1]) / 1000.0) * page_height, 2)
-                x2 = round((float(raw_bbox[2]) / 1000.0) * page_width, 2)
-                y2 = round((float(raw_bbox[3]) / 1000.0) * page_height, 2)
+                if max(raw_bbox) <= 1000.0 and (page_width > 1000 or page_height > 1000):
+                    x1 = round((float(raw_bbox[0]) / 1000.0) * page_width, 2)
+                    y1 = round((float(raw_bbox[1]) / 1000.0) * page_height, 2)
+                    x2 = round((float(raw_bbox[2]) / 1000.0) * page_width, 2)
+                    y2 = round((float(raw_bbox[3]) / 1000.0) * page_height, 2)
+                else:
+                    x1 = round(float(raw_bbox[0]), 2)
+                    y1 = round(float(raw_bbox[1]), 2)
+                    x2 = round(float(raw_bbox[2]), 2)
+                    y2 = round(float(raw_bbox[3]), 2)
                 px_bbox = [x1, y1, x2, y2]
             else:
-                px_bbox = [0, 0, 0, 0]
+                px_bbox = [0.0, 0.0, 0.0, 0.0]
 
-            content = str(item.get("text") or "").strip()
+            content = str(item.get("text") or item.get("content") or "").strip()
+            block_conf = float(item.get("confidence", 0.95))
+
             if content:
                 text_parts.append(content)
                 tsv_lines.append(f"{px_bbox[0]}\t{px_bbox[1]}\t{px_bbox[2]}\t{px_bbox[3]}\t{content}")
 
-            blocks.append({
+            words_list = []
+            if isinstance(item.get("words"), list) and len(item["words"]) > 0:
+                for w in item["words"]:
+                    if isinstance(w, dict) and "text" in w:
+                        w_bbox = w.get("bbox") or [0, 0, 0, 0]
+                        if isinstance(w_bbox, (list, tuple)) and len(w_bbox) == 4:
+                            if max(w_bbox) <= 1000.0 and (page_width > 1000 or page_height > 1000):
+                                wx1 = round((float(w_bbox[0]) / 1000.0) * page_width, 2)
+                                wy1 = round((float(w_bbox[1]) / 1000.0) * page_height, 2)
+                                wx2 = round((float(w_bbox[2]) / 1000.0) * page_width, 2)
+                                wy2 = round((float(w_bbox[3]) / 1000.0) * page_height, 2)
+                                px_w_bbox = [wx1, wy1, wx2, wy2]
+                            else:
+                                px_w_bbox = [round(float(c), 2) for c in w_bbox]
+                        else:
+                            px_w_bbox = [0.0, 0.0, 0.0, 0.0]
+
+                        w_conf = float(w.get("confidence", block_conf))
+                        w_obj = {
+                            "text": str(w["text"]),
+                            "bbox": px_w_bbox,
+                            "confidence": round(w_conf, 3)
+                        }
+                        words_list.append(w_obj)
+                        all_word_confidences.append(w_conf)
+            else:
+                words_list = _generate_word_spans(content, px_bbox, block_conf)
+                for w in words_list:
+                    all_word_confidences.append(w["confidence"])
+
+            block_obj = {
                 "id": f"b{i}",
                 "type": block_type,
                 "bbox": px_bbox,
                 "reading_order": i,
                 "content": content,
-                "confidence": 0.95,
-                "language": language or "sa"
-            })
+                "confidence": round(block_conf, 3),
+                "words": words_list
+            }
+            blocks.append(block_obj)
+
     elif isinstance(parsed_layout, str) and parsed_layout.strip():
         content = parsed_layout.strip()
         text_parts.append(content)
+        px_bbox = [0.0, 0.0, float(page_width), float(page_height)]
+        words_list = _generate_word_spans(content, px_bbox, 0.95)
+        for w in words_list:
+            all_word_confidences.append(w["confidence"])
         blocks.append({
             "id": "b1",
             "type": "paragraph",
-            "bbox": [0, 0, page_width, page_height],
+            "bbox": px_bbox,
             "reading_order": 1,
             "content": content,
             "confidence": 0.95,
-            "language": language or "sa"
+            "words": words_list
         })
 
     plain_text = "\n\n".join(text_parts)
     tsv_text = "\n".join(tsv_lines)
 
+    if all_word_confidences:
+        page_confidence = round(sum(all_word_confidences) / len(all_word_confidences), 3)
+    elif blocks:
+        page_confidence = round(sum(b["confidence"] for b in blocks) / len(blocks), 3)
+    else:
+        page_confidence = 0.95
+
+    engine_latency_ms = round(duration_seconds * 1000.0, 2)
+    selected_engine = (engine or "dots_ocr").strip()
+
     return {
-        # Kalanjiyam OCR Service Contract (v2) fields
-        "contract_version": "2.0",
-        "engine": "dots_ocr",
-        "model": {"name": "dots-ocr", "version": "4.0.0"},
+        # Kalanjiyam OCR Service Contract (v2.1) required fields
+        "contract_version": "2.1",
+        "engine": selected_engine,
+        "model": {
+            "name": "dots-ocr",
+            "version": "4.0.0"
+        },
+        "page_confidence": page_confidence,
+        "engine_latency_ms": engine_latency_ms,
+        "page_width": int(page_width),
+        "page_height": int(page_height),
+        "blocks": blocks,
+
+        # Additional standalone / backwards compatibility fields
         "source_type": "scan",
         "coordinate_space": "pixel",
-        "page_width": page_width,
-        "page_height": page_height,
-        "page_confidence": 0.95,
-        "blocks": blocks,
         "text": plain_text,
         "bounding_boxes": tsv_text,
-
-        # Standalone service fields (backwards compatibility)
         "status": "success",
         "filename": filename,
         "gpu_assigned": active_gpu,
         "results": parsed_layout,
         "metrics": {
             "time_taken_seconds": duration_seconds,
+            "engine_latency_ms": engine_latency_ms,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
@@ -752,6 +887,7 @@ async def run_ocr(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             throughput=throughput,
+            engine=engine,
         )
 
 

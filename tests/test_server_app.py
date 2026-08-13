@@ -215,3 +215,52 @@ def test_api_v1_ocr_endpoint_schema():
     resp = client.get("/v1/engines")
     assert resp.status_code == 200
     assert resp.json() == {"engines": ["dots-ocr"]}
+
+
+def test_document_and_project_level_aggregation_simulation():
+    """Simulate Document & Project Level Aggregated Metrics (Section 4)."""
+    image_bytes = create_dummy_image(1000, 1000)
+
+    page1 = format_kalanjiyam_v2_response(
+        parsed_layout=[{"category": "text", "bbox": [10, 10, 900, 500], "text": "Page one text content.", "confidence": 0.95}],
+        image_bytes=image_bytes,
+        filename="page1.jpg",
+        active_gpu=0,
+        language="en",
+        duration_seconds=0.35,
+        prompt_tokens=10,
+        completion_tokens=20,
+        throughput=50.0,
+        engine="surya",
+    )
+
+    page2 = format_kalanjiyam_v2_response(
+        parsed_layout=[{"category": "text", "bbox": [10, 10, 900, 500], "text": "Low quality page content.", "confidence": 0.62}],
+        image_bytes=image_bytes,
+        filename="page2.jpg",
+        active_gpu=0,
+        language="en",
+        duration_seconds=0.45,
+        prompt_tokens=10,
+        completion_tokens=20,
+        throughput=40.0,
+        engine="surya",
+    )
+
+    pages = [page1, page2]
+
+    # Section 4 Metric Rollups
+    total_pages = len(pages)
+    avg_conf = sum(p["page_confidence"] for p in pages) / total_pages
+    min_conf = min(p["page_confidence"] for p in pages)
+    low_conf_page_count = sum(1 for p in pages if p["page_confidence"] < 0.7)
+    avg_engine_latency_sec = sum(p["engine_latency_ms"] / 1000.0 for p in pages) / total_pages
+    total_chars = sum(sum(len(b["content"]) for b in p["blocks"]) for p in pages)
+
+    assert total_pages == 2
+    assert round(avg_conf, 3) == 0.785
+    assert min_conf == 0.62
+    assert low_conf_page_count == 1
+    assert round(avg_engine_latency_sec, 2) == 0.40
+    assert total_chars == len("Page one text content.") + len("Low quality page content.")
+

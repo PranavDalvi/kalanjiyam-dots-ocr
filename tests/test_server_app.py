@@ -3,7 +3,7 @@ import io
 import math
 from PIL import Image
 from fastapi.testclient import TestClient
-from server_app import app, format_kalanjiyam_v2_response, _generate_word_spans
+from server_app import app, format_kalanjiyam_v2_response, _generate_word_spans, scale_bbox_to_pixels
 
 
 def create_dummy_image(width=1240, height=1754) -> bytes:
@@ -263,4 +263,103 @@ def test_document_and_project_level_aggregation_simulation():
     assert low_conf_page_count == 1
     assert round(avg_engine_latency_sec, 2) == 0.40
     assert total_chars == len("Page one text content.") + len("Low quality page content.")
+
+
+def test_scale_bbox_to_pixels_cases():
+    """Verify scale_bbox_to_pixels across all required edge cases (Cases A-F)."""
+    # Case A & B: Normalized [0, 1000] scale on standard page (1240 x 1754)
+    res = scale_bbox_to_pixels([100, 40, 900, 88], 1240, 1754)
+    assert res == [124.0, 70.16, 1116.0, 154.35]
+
+    # Case C: Large image (2000 x 3000)
+    res_large = scale_bbox_to_pixels([100, 200, 900, 800], 2000, 3000)
+    assert res_large == [200.0, 600.0, 1800.0, 2400.0]
+
+    # Case D: Small image (800 x 600) - specifically checks fix for width/height <= 1000
+    res_small = scale_bbox_to_pixels([100, 200, 900, 800], 800, 600)
+    assert res_small == [80.0, 120.0, 720.0, 480.0]
+
+    # Case E: Bbox touching image boundaries [0, 0, 1000, 1000]
+    res_bound = scale_bbox_to_pixels([0, 0, 1000, 1000], 1200, 1600)
+    assert res_bound == [0.0, 0.0, 1200.0, 1600.0]
+
+    # Case E2: Slight model float overshoot / negative values
+    res_overshoot = scale_bbox_to_pixels([-5.0, -10.0, 1005.0, 1008.0], 1000, 1000)
+    assert res_overshoot == [0.0, 0.0, 1000.0, 1000.0]
+
+    # Case F: Malformed bboxes
+    assert scale_bbox_to_pixels(None, 1000, 1000) == [0.0, 0.0, 0.0, 0.0]
+    assert scale_bbox_to_pixels([100, 200], 1000, 1000) == [0.0, 0.0, 0.0, 0.0]
+    assert scale_bbox_to_pixels(["invalid", "data", "bad", "type"], 1000, 1000) == [0.0, 0.0, 0.0, 0.0]
+    assert scale_bbox_to_pixels("not a list", 1000, 1000) == [0.0, 0.0, 0.0, 0.0]
+
+    # Inverted coordinates [x2, y2, x1, y1] should be sorted properly
+    res_inverted = scale_bbox_to_pixels([900, 800, 100, 200], 1000, 1000)
+    assert res_inverted == [100.0, 200.0, 900.0, 800.0]
+
+    # Explicit pixel coordinates on large page (>1050 values within dimensions)
+    res_already_px = scale_bbox_to_pixels([1200, 1500, 1800, 2500], 2000, 3000)
+    assert res_already_px == [1200.0, 1500.0, 1800.0, 2500.0]
+
+
+def test_small_image_end_to_end_scaling():
+    """Verify end-to-end response formatting for small image (800 x 600)."""
+    image_bytes = create_dummy_image(800, 600)
+    parsed_layout = [
+        {
+            "category": "title",
+            "bbox": [100, 100, 900, 200],  # 10%-90% width, 10%-20% height
+            "text": "Small Image Title",
+            "confidence": 0.98,
+        }
+    ]
+
+    resp = format_kalanjiyam_v2_response(
+        parsed_layout=parsed_layout,
+        image_bytes=image_bytes,
+        filename="small.jpg",
+        active_gpu=0,
+        language="en",
+        duration_seconds=0.15,
+        prompt_tokens=20,
+        completion_tokens=30,
+        throughput=200.0,
+    )
+
+    block = resp["blocks"][0]
+    # Expected: x1 = 80.0, y1 = 60.0, x2 = 720.0, y2 = 120.0
+    assert block["bbox"] == [80.0, 60.0, 720.0, 120.0]
+    assert block["words"][0]["bbox"][0] >= 80.0
+    assert block["words"][-1]["bbox"][2] <= 720.0
+
+
+def test_debug_bbox_flag(monkeypatch):
+    """Verify DEBUG_BBOX exposes raw model response and bbox coordinates."""
+    import server_app
+    monkeypatch.setattr(server_app, "DEBUG_BBOX", True)
+
+    image_bytes = create_dummy_image(1000, 1000)
+    parsed_layout = [
+        {"category": "text", "bbox": [50, 50, 950, 950], "text": "Debug text", "confidence": 0.95}
+    ]
+
+    resp = format_kalanjiyam_v2_response(
+        parsed_layout=parsed_layout,
+        image_bytes=image_bytes,
+        filename="debug_test.jpg",
+        active_gpu=0,
+        language="en",
+        duration_seconds=0.1,
+        prompt_tokens=10,
+        completion_tokens=20,
+        throughput=200.0,
+    )
+
+    assert "debug_bbox" in resp
+    assert resp["debug_bbox"]["image_width"] == 1000
+    assert resp["debug_bbox"]["image_height"] == 1000
+    assert resp["debug_bbox"]["raw_model_response"] == parsed_layout
+    assert len(resp["debug_bbox"]["final_bboxes"]) == 1
+    assert resp["debug_bbox"]["final_bboxes"][0] == [50.0, 50.0, 950.0, 950.0]
+
 

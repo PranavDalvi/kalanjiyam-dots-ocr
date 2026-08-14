@@ -40,6 +40,7 @@ VLLM_PORT = int(os.getenv("VLLM_PORT", "8000"))
 VLLM_BASE_URL = f"http://localhost:{VLLM_PORT}/v1/chat/completions"
 MODEL_PATH = os.getenv("MODEL_PATH", "rednote-hilab/dots.ocr")
 MODEL_NAME = "model"
+DEBUG_BBOX = os.getenv("DEBUG_BBOX", "0").lower() in ("1", "true", "yes")
 
 # Asyncio Semaphore to restrict maximum parallel in-flight OCR requests at API level
 request_semaphore = asyncio.Semaphore(API_MAX_CONCURRENT_REQUESTS)
@@ -516,6 +517,53 @@ def convert_image_bytes_to_base64_uri(image_bytes: bytes) -> str:
         raise ValueError(f"Invalid image format or corrupted image file: {str(err)}")
 
 
+def scale_bbox_to_pixels(raw_bbox: list, page_width: float, page_height: float) -> list[float]:
+    """
+    Converts Dots.OCR bounding box coordinates to image pixel coordinates [x1, y1, x2, y2].
+
+    Dots.OCR natively outputs bounding boxes normalized to the [0, 1000] scale.
+    This function converts [0, 1000] coordinates to [0..page_width, 0..page_height].
+    If raw_bbox is already in absolute pixel space (e.g. values > 1050 within image bounds),
+    or if coordinates touch/slightly overshoot boundaries, it clamps safely within
+    [0, page_width] and [0, page_height]. Malformed bboxes gracefully return [0.0, 0.0, 0.0, 0.0].
+    """
+    if not isinstance(raw_bbox, (list, tuple)) or len(raw_bbox) != 4:
+        return [0.0, 0.0, 0.0, 0.0]
+
+    try:
+        c1, c2, c3, c4 = float(raw_bbox[0]), float(raw_bbox[1]), float(raw_bbox[2]), float(raw_bbox[3])
+    except (ValueError, TypeError):
+        return [0.0, 0.0, 0.0, 0.0]
+
+    pw = max(1.0, float(page_width))
+    ph = max(1.0, float(page_height))
+
+    # Detect if bbox is already in pixel coordinates (only when coordinates exceed normalized
+    # threshold and fit within actual pixel dimensions).
+    is_already_pixel = (max(c1, c2, c3, c4) > 1050.0 and max(c1, c2, c3, c4) <= max(pw, ph))
+
+    if is_already_pixel:
+        x1, y1, x2, y2 = c1, c2, c3, c4
+    else:
+        # Standard Dots.OCR normalized [0, 1000] -> pixel coordinates
+        x1 = (c1 / 1000.0) * pw
+        y1 = (c2 / 1000.0) * ph
+        x2 = (c3 / 1000.0) * pw
+        y2 = (c4 / 1000.0) * ph
+
+    # Ensure min <= max
+    min_x, max_x = min(x1, x2), max(x1, x2)
+    min_y, max_y = min(y1, y2), max(y1, y2)
+
+    # Clamp coordinates to image boundaries
+    clamped_x1 = max(0.0, min(pw, min_x))
+    clamped_y1 = max(0.0, min(ph, min_y))
+    clamped_x2 = max(0.0, min(pw, max_x))
+    clamped_y2 = max(0.0, min(ph, max_y))
+
+    return [round(clamped_x1, 2), round(clamped_y1, 2), round(clamped_x2, 2), round(clamped_y2, 2)]
+
+
 def _generate_word_spans(content: str, px_bbox: list[float], block_confidence: float) -> list[dict]:
     """Generates word span objects with bounding boxes and confidence scores."""
     if not content:
@@ -610,20 +658,7 @@ def format_kalanjiyam_v2_response(
                 block_type = raw_cat if raw_cat in ALLOWED_BLOCK_TYPES else "paragraph"
 
             raw_bbox = item.get("bbox") or [0, 0, 0, 0]
-            if isinstance(raw_bbox, (list, tuple)) and len(raw_bbox) == 4:
-                if max(raw_bbox) <= 1000.0 and (page_width > 1000 or page_height > 1000):
-                    x1 = round((float(raw_bbox[0]) / 1000.0) * page_width, 2)
-                    y1 = round((float(raw_bbox[1]) / 1000.0) * page_height, 2)
-                    x2 = round((float(raw_bbox[2]) / 1000.0) * page_width, 2)
-                    y2 = round((float(raw_bbox[3]) / 1000.0) * page_height, 2)
-                else:
-                    x1 = round(float(raw_bbox[0]), 2)
-                    y1 = round(float(raw_bbox[1]), 2)
-                    x2 = round(float(raw_bbox[2]), 2)
-                    y2 = round(float(raw_bbox[3]), 2)
-                px_bbox = [x1, y1, x2, y2]
-            else:
-                px_bbox = [0.0, 0.0, 0.0, 0.0]
+            px_bbox = scale_bbox_to_pixels(raw_bbox, page_width, page_height)
 
             content = str(item.get("text") or item.get("content") or "").strip()
             block_conf = float(item.get("confidence", 0.95))
@@ -637,17 +672,7 @@ def format_kalanjiyam_v2_response(
                 for w in item["words"]:
                     if isinstance(w, dict) and "text" in w:
                         w_bbox = w.get("bbox") or [0, 0, 0, 0]
-                        if isinstance(w_bbox, (list, tuple)) and len(w_bbox) == 4:
-                            if max(w_bbox) <= 1000.0 and (page_width > 1000 or page_height > 1000):
-                                wx1 = round((float(w_bbox[0]) / 1000.0) * page_width, 2)
-                                wy1 = round((float(w_bbox[1]) / 1000.0) * page_height, 2)
-                                wx2 = round((float(w_bbox[2]) / 1000.0) * page_width, 2)
-                                wy2 = round((float(w_bbox[3]) / 1000.0) * page_height, 2)
-                                px_w_bbox = [wx1, wy1, wx2, wy2]
-                            else:
-                                px_w_bbox = [round(float(c), 2) for c in w_bbox]
-                        else:
-                            px_w_bbox = [0.0, 0.0, 0.0, 0.0]
+                        px_w_bbox = scale_bbox_to_pixels(w_bbox, page_width, page_height)
 
                         w_conf = float(w.get("confidence", block_conf))
                         w_obj = {
@@ -703,7 +728,7 @@ def format_kalanjiyam_v2_response(
     engine_latency_ms = round(duration_seconds * 1000.0, 2)
     selected_engine = (engine or "dots_ocr").strip()
 
-    return {
+    result_payload = {
         # Kalanjiyam OCR Service Contract (v2.1) required fields
         "contract_version": "2.1",
         "engine": selected_engine,
@@ -735,6 +760,20 @@ def format_kalanjiyam_v2_response(
             "generation_speed_tok_per_sec": throughput
         }
     }
+
+    if DEBUG_BBOX:
+        log("DEBUG_BBOX", f"[{filename}] Dimensions: {page_width}x{page_height} | Parsed Blocks: {len(blocks)}")
+        for b in blocks:
+            log("DEBUG_BBOX", f"  [{b['id']}] type={b['type']} bbox={b['bbox']}")
+        result_payload["debug_bbox"] = {
+            "image_width": int(page_width),
+            "image_height": int(page_height),
+            "raw_model_response": parsed_layout,
+            "parsed_bboxes": [b["bbox"] for b in blocks],
+            "final_bboxes": [b["bbox"] for b in blocks]
+        }
+
+    return result_payload
 
 
 @app.get("/v1/engines")
@@ -858,6 +897,9 @@ async def run_ocr(
             raise HTTPException(status_code=502, detail=f"Backend request failed: {str(req_err)}")
 
         content_text = res_json["choices"][0]["message"]["content"]
+
+        if DEBUG_BBOX:
+            log("DEBUG_BBOX", f"Raw Model Output for '{filename}':\n{content_text}")
 
         parsed_layout = None
         try:

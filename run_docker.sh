@@ -31,7 +31,7 @@ case "$ACTION" in
     echo "[Docker Manager] GPUs: ${GPU_COUNT:-1} | API queue: ${API_MAX_CONCURRENT_REQUESTS:-8} | vLLM base port: ${VLLM_PORT:-8000} | vLLM sequences/GPU: ${VLLM_MAX_NUM_SEQS:-1} | GPU memory target: ${GPU_MEMORY_UTILIZATION:-0.90}"
     export HOST_MODEL_PATH="$MODEL_HOST_PATH"
     $COMPOSE_CMD up -d --build
-    echo "[Docker Manager] Container started! Endpoint available at http://localhost:8887/ocr"
+    echo "[Docker Manager] Container started! Endpoint available at http://localhost:8887/v1/ocr"
     ;;
 
   stop)
@@ -53,7 +53,7 @@ case "$ACTION" in
     echo "[Docker Manager] Building and starting four pinned DotsOCR GPU workers with a router on port 8887..."
     export HOST_MODEL_PATH="$MODEL_HOST_PATH"
     $COMPOSE_CMD -f docker-compose.multi-gpu.yml up -d --build
-    echo "[Docker Manager] Multi-GPU OCR API is available at http://localhost:8887/ocr"
+    echo "[Docker Manager] Multi-GPU OCR API is available at http://localhost:8887/v1/ocr"
     ;;
 
   stop-multi)

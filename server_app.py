@@ -1560,7 +1560,6 @@ def health_check(engine: Optional[str] = None):
     return JSONResponse(status_code=200 if available else 503, content=payload)
 
 
-@app.post("/ocr")
 @app.post("/v1/ocr")
 async def run_ocr(
     file: Optional[UploadFile] = File(None, description="Image file (PNG, JPG, JPEG, WEBP)"),

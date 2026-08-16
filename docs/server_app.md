@@ -54,7 +54,7 @@ the number of active model generations, not merely the size of the HTTP queue.
 
 Use the dedicated multi-GPU deployment rather than `GPU_COUNT=4` in one API
 container. It starts one pinned worker per GPU and a router that preserves the
-existing `http://<host>:8887/ocr` API URL.
+existing `http://<host>:8887/v1/ocr` API URL.
 
 ```bash
 # Stop the single-GPU service first, then start the isolated workers and router.
@@ -79,10 +79,10 @@ with `GPU_MEMORY_HEADROOM_MB` only if your host requires more headroom.
 
 ## API Endpoints Reference
 
-### 1. `POST /ocr` or `POST /v1/ocr` (Image-Only OCR Endpoint)
+### 1. `POST /v1/ocr` (Image-Only OCR Endpoint)
 Processes an uploaded image file (`.png`, `.jpg`, `.jpeg`, `.webp`).
 
-* **URL**: `http://<SERVER_IP>:8887/ocr` (or `/v1/ocr`)
+* **URL**: `http://<SERVER_IP>:8887/v1/ocr`
 * **Method**: `POST`
 * **Content-Type**: `multipart/form-data`
 * **Form Fields**:
@@ -100,7 +100,7 @@ DEFAULT_ENGINE=gemma-4 python server_app.py
 ```
 Or specify the engine dynamically per request:
 ```bash
-curl -X POST http://localhost:8887/ocr \
+curl -X POST http://localhost:8887/v1/ocr \
   -F "file=@document.jpg" \
   -F "engine=gemma-4"
 ```

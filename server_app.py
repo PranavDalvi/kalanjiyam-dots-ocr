@@ -192,7 +192,14 @@ def ensure_model_downloaded(engine_id: str = "dots-ocr") -> str:
     config = ENGINE_CONFIGS.get(canonical_engine, ENGINE_CONFIGS["dots-ocr"])
 
     target_dir = config["local_cache_dir"]
-    model_to_use = MODEL_PATH if MODEL_PATH else config["default_model_path"]
+    if canonical_engine == "dots-ocr":
+        model_to_use = os.getenv("DOTSOCR_MODEL_PATH", MODEL_PATH if MODEL_PATH and "gemma" not in MODEL_PATH.lower() else config["default_model_path"])
+    elif canonical_engine == "gemma-4":
+        model_to_use = os.getenv("GEMMA4_MODEL_PATH", MODEL_PATH if MODEL_PATH and "gemma" in MODEL_PATH.lower() else config["default_model_path"])
+    elif canonical_engine == "kalanjiyam-archival":
+        model_to_use = os.getenv("METADATA_MODEL_PATH", os.getenv("GEMMA4_MODEL_PATH", config["default_model_path"]))
+    else:
+        model_to_use = config["default_model_path"]
 
     # If already a local directory with model files
     if os.path.exists(model_to_use) and os.path.isdir(model_to_use) and os.path.exists(os.path.join(model_to_use, "config.json")):
@@ -559,6 +566,19 @@ class GPUProcessManager:
                     "--served-model-name", MODEL_NAME,
                     "--port", str(port),
                 ]
+                max_model_len = os.getenv("VLLM_MAX_MODEL_LEN", os.getenv(f"{canonical_engine.upper().replace('-', '_')}_MAX_MODEL_LEN", ""))
+                if max_model_len:
+                    cmd.extend(["--max-model-len", str(max_model_len)])
+                elif canonical_engine == "gemma-4":
+                    cmd.extend(["--max-model-len", "8192"])
+
+                vllm_dtype = os.getenv("VLLM_DTYPE", "auto")
+                if vllm_dtype and vllm_dtype != "auto":
+                    cmd.extend(["--dtype", vllm_dtype])
+
+                if os.getenv("VLLM_ENFORCE_EAGER", "0").lower() in ("1", "true", "yes"):
+                    cmd.append("--enforce-eager")
+
                 if VLLM_MAX_NUM_BATCHED_TOKENS:
                     cmd.extend(["--max-num-batched-tokens", VLLM_MAX_NUM_BATCHED_TOKENS])
                 log("BACKEND LAUNCH", f"Launching {canonical_engine} worker {worker_index + 1}/{GPU_COUNT} on GPU {gpu_idx}, port {port}, memory target {safe_utilization}.")

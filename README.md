@@ -1,12 +1,14 @@
-# Async Inference Script
+# Kalanjiyam DotsOCR & Archival Metadata Extraction Service
 
-A high-throughput async inference pipeline for processing images and PDFs through LLM backends (SGLang, vLLM, LMDeploy, TRT-LLM). Supports local files, directories, and S3 paths, with disk spillover buffering, process-pool-based image conversion, and resume-on-crash.
+A high-performance FastAPI service providing layout-aware OCR (DotsOCR / Gemma-4) and Archival Metadata Extraction with dynamic GPU allocation and concurrency gating.
 
 ---
 
-## Features
+## Key Features
 
-- Streams images and PDFs from local disk or S3
+- **Layout-Aware OCR (`POST /v1/ocr`)**: Processes document images into typed layout blocks (headings, paragraphs, tables, equations) with pixel bounding boxes conforming to Kalanjiyam OCR Service Contract (v2.1).
+- **Archival Metadata Extraction (`POST /v1/metadata`)**: Stateless per-window metadata extraction returning structured archival description fields (titles, dates, entities, scope content) alongside per-window metrics (`chars_in`, `engine_latency_ms`, `usage`, `fields_attempted`, `fields_returned`, `fields_declined`) using `gemma-4`, conforming to **Metadata Extraction API Specification (v1.0)**.
+- **Async Batch Inference Pipeline (`async_infer-lazy-buffer_newer_w_s3.py`)**: High-throughput pipeline streaming images and PDFs from local disk or S3 through LLM backends (vLLM, SGLang, LMDeploy, TRT-LLM).
 - Converts PDFs to images lazily per-page using PyMuPDF
 - Concurrent inference with configurable concurrency and request rate
 - Disk spill buffer when RAM queue is full

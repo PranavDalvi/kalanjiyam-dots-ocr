@@ -164,15 +164,96 @@ curl http://localhost:8887/v1/engines
 
 ---
 
-### 2. `GET /gpu-status`
-Query active GPU VRAM, hardware presence, and idle timeout status.
+### 2. `POST /v1/metadata` (Archival Metadata Extraction)
+The **only** metadata endpoint needed on the microservice. Accepts a single token-budgeted window of document pages with typed blocks and target tags. Runs **`gemma-4`** (`gemma-4-26b-a4b-it`) and returns extracted fields (with verbatim quotes in evidence for `record` source values) along with raw window metrics (`chars_in`, `engine_latency_ms`, `usage`, `fields_attempted`, `fields_returned`, `fields_declined`) in a **single JSON response** conforming to **Metadata Extraction API Response & Metrics Specification (v1.0)**.
+
+> **Note**: Evidence verification, per-window derived metrics, and full-document rollups are handled internally by Kalanjiyam (`archival_reduce.py`) to maintain independent, tamper-proof quality scoring.
+
+* **URL**: `http://<SERVER_IP>:8887/v1/metadata`
+* **Method**: `POST`
+* **Content-Type**: `application/json`
+
+#### Request Payload Example:
+```json
+{
+  "contract_version": "1.0",
+  "unit_id": "kalanjiyam:project/kalat-1932-17",
+  "window": {
+    "index": 3,
+    "total": 24,
+    "page_slugs": ["61", "62", "63", "64", "65"]
+  },
+  "taxonomy_version": "client-2026-08",
+  "tags": ["TITLE", "DATE", "CREATOR", "SCOPE CONTENT", "PERSON NAME", "PLACE"],
+  "language_hint": ["fa", "ur", "en"],
+  "pages": [
+    {
+      "page_slug": "61",
+      "ocr_confidence": 0.94,
+      "blocks": [
+        {"id": "b1", "type": "heading", "reading_order": 1, "text": "Grant of an honorary commission to Lt. Shahzada Ahmad Yar Khan"},
+        {"id": "b2", "type": "paragraph", "reading_order": 2, "text": "Correspondence concerning the proposal to confer an honorary commission."}
+      ]
+    }
+  ]
+}
+```
+
+#### Response Payload Example (Specification v1.0):
+```json
+{
+  "contract_version": "1.0",
+  "status": "success",
+  "engine": "gemma-4",
+  "model": {
+    "name": "gemma-4-26b-a4b-it",
+    "version": "1.0.0"
+  },
+  "taxonomy_version": "client-2026-08",
+  "unit_id": "kalanjiyam:project/kalat-1932-17",
+  "window_index": 3,
+  "chars_in": 18234,
+  "engine_latency_ms": 3120.4,
+  "usage": {
+    "prompt_tokens": 14320,
+    "completion_tokens": 2870,
+    "total_tokens": 17190
+  },
+  "fields_attempted": 6,
+  "fields_returned": 4,
+  "fields_declined": 2,
+  "fields": {
+    "TITLE": {
+      "value": "Grant of an honorary commission to Lt. Shahzada Ahmad Yar Khan",
+      "confidence": 0.91,
+      "source": "record",
+      "evidence": [
+        {"page_slug": "61", "block_id": "b1", "quote": "Grant of an honorary commission"}
+      ]
+    },
+    "SCOPE CONTENT": {
+      "value": "Correspondence concerning the proposal to confer an honorary commission...",
+      "confidence": 0.80,
+      "source": "derived",
+      "evidence": [
+        {"page_slug": "61"}
+      ]
+    }
+  }
+}
+```
 
 ---
 
-### 3. `POST /free-vram`
+### 3. `GET /gpu-status`
+Query active GPU VRAM usage, hardware presence, and idle timeout status.
+
+---
+
+### 4. `POST /free-vram`
 Manually stop the backend model process and free 100% VRAM.
 
 ---
 
-### 4. `GET /health`
+### 5. `GET /health`
 Service status check.

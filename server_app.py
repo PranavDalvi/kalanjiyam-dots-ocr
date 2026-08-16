@@ -8,17 +8,20 @@ import signal
 import threading
 import asyncio
 import sys
-from typing import Optional
+import re
+from typing import Optional, List, Dict, Any, Union, Set
 import requests
 import io
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from PIL import Image
 
 app = FastAPI(
-    title="DotsOCR Dynamic GPU Image API Service",
-    description="Streamlined FastAPI service optimized exclusively for image inputs (PNG, JPG, JPEG, WEBP) with dynamic GPU VRAM allocation and step-by-step console logging.",
-    version="4.0.0"
+    title="Kalanjiyam OCR & Archival Metadata Extraction API Service",
+    description="Streamlined FastAPI service for OCR layout recognition and archival metadata extraction with dynamic GPU VRAM allocation.",
+    version="4.1.0"
 )
 
 # Configuration defaults
@@ -42,6 +45,7 @@ MODEL_PATH = os.getenv("MODEL_PATH", "")
 MODEL_NAME = "model"
 DEBUG_BBOX = os.getenv("DEBUG_BBOX", "0").lower() in ("1", "true", "yes")
 DEFAULT_ENGINE = os.getenv("DEFAULT_ENGINE", os.getenv("ENGINE", "dots-ocr")).strip().lower()
+DEFAULT_METADATA_ENGINE = os.getenv("DEFAULT_METADATA_ENGINE", "gemma-4").strip().lower()
 
 # Asyncio Semaphore to restrict maximum parallel in-flight OCR requests at API level
 request_semaphore = asyncio.Semaphore(API_MAX_CONCURRENT_REQUESTS)
@@ -107,6 +111,13 @@ ENGINE_CONFIGS = {
             "google/gemma-4-26b-it",
             "gemma",
             "gemma-4-26b-a4b",
+            "kalanjiyam-archival",
+            "kalanjiyam_archival",
+            "archival",
+            "metadata",
+            "kalanjiyam-metadata",
+            "gemma-3-27b-it",
+            "gemma-3",
         ],
         "default_model_path": os.getenv("GEMMA4_MODEL_PATH", "google/gemma-4-26B-A4B-it"),
         "local_cache_dir": "/root/.cache/weights/gemma-4-26B-A4B-it",
@@ -115,6 +126,19 @@ ENGINE_CONFIGS = {
         "requires_native_registration": False,
         "prompt": GEMMA4_OCR_PROMPT,
         "min_free_vram_mb": int(os.getenv("GEMMA4_MIN_FREE_VRAM_MB", "30000")),
+    },
+    "kalanjiyam-archival": {
+        "engine_id": "kalanjiyam-archival",
+        "aliases": [
+            "kalanjiyam-archival-legacy",
+        ],
+        "default_model_path": os.getenv("METADATA_MODEL_PATH", os.getenv("GEMMA4_MODEL_PATH", "google/gemma-4-26B-A4B-it")),
+        "local_cache_dir": "/root/.cache/weights/gemma-4-26B-A4B-it",
+        "model_name": os.getenv("METADATA_MODEL_NAME", "gemma-4-26b-a4b-it"),
+        "model_version": "1.0.0",
+        "requires_native_registration": False,
+        "prompt": "",
+        "min_free_vram_mb": int(os.getenv("METADATA_MIN_FREE_VRAM_MB", os.getenv("GEMMA4_MIN_FREE_VRAM_MB", "30000"))),
     },
 }
 
@@ -137,6 +161,8 @@ def resolve_engine(engine_name: Optional[str]) -> str:
             return engine_id
 
     # Keyword heuristics
+    if "archival" in cleaned or "metadata" in cleaned:
+        return "gemma-4"
     if "gemma" in cleaned:
         return "gemma-4"
     if "dots" in cleaned:
@@ -606,6 +632,546 @@ CATEGORY_MAP = {
     "running-header": "running-header",
     "page-number": "page-number",
 }
+
+
+# =============================================================================
+# METADATA EXTRACTION & METRICS MODELS (Contract v1.0)
+# =============================================================================
+
+class BlockInput(BaseModel):
+    id: str = Field(..., description="Unique block ID within the page (e.g. 'b1')")
+    type: str = Field(..., description="Layout block type (e.g. 'heading', 'paragraph', 'table')")
+    reading_order: Optional[Union[int, float]] = Field(None, description="Reading order index")
+    text: str = Field("", description="Text content of the block")
+
+
+class PageInput(BaseModel):
+    page_slug: str = Field(..., description="Page slug identifier (e.g. '61')")
+    ocr_confidence: Optional[float] = Field(None, description="Nullable OCR confidence score")
+    blocks: List[BlockInput] = Field(default_factory=list, description="Typed layout blocks")
+
+
+class WindowInput(BaseModel):
+    index: int = Field(..., description="Window index (e.g. 3)")
+    total: int = Field(..., description="Total windows for this document (e.g. 24)")
+    page_slugs: List[str] = Field(default_factory=list, description="List of page slugs in this window")
+
+
+class MetadataRequest(BaseModel):
+    contract_version: str = Field("1.0", description="Contract version (must be '1.0')")
+    unit_id: str = Field(..., description="Unique archival document unit ID")
+    window: WindowInput = Field(..., description="Window info")
+    taxonomy_version: str = Field(..., description="Taxonomy schema revision (e.g. 'client-2026-08')")
+    tags: List[str] = Field(..., description="Authoritative list of requested metadata tags")
+    language_hint: Optional[List[str]] = Field(None, description="Optional language hints")
+    pages: List[PageInput] = Field(..., description="Pages and typed blocks in this window")
+    engine: Optional[str] = Field(None, description="Optional extraction engine override")
+    max_tokens: Optional[int] = Field(None, description="Max generation tokens (default >= 4500)")
+
+
+class EvidenceSpan(BaseModel):
+    page_slug: str = Field(..., description="Cited page slug")
+    block_id: Optional[str] = Field(None, description="Cited block ID (for record source)")
+    quote: Optional[str] = Field(None, description="Verbatim quote from source block")
+
+
+class EntityValue(BaseModel):
+    label: str = Field(..., description="Entity name as in record")
+    variants: Optional[List[str]] = Field(None, description="Variant names seen in window")
+    dates: Optional[str] = Field(None, description="Life or existence dates if stated")
+    auth_id: Optional[str] = Field(None, description="Authority file ID if explicitly stated")
+    source: str = Field("record", description="Source kind: record, derived, enrichment")
+    evidence: Optional[List[EvidenceSpan]] = Field(None, description="Evidence spans")
+    note: Optional[str] = Field(None, description="Optional notes")
+
+
+class ModelInfo(BaseModel):
+    name: str = Field(..., description="Model name")
+    version: str = Field(..., description="Model version")
+
+
+class TokenUsage(BaseModel):
+    prompt_tokens: int = Field(..., description="Prompt tokens consumed")
+    completion_tokens: int = Field(..., description="Completion tokens generated")
+    total_tokens: int = Field(..., description="Total tokens consumed")
+
+
+class MetadataResponse(BaseModel):
+    contract_version: str = Field("1.0", description="Specification version '1.0'")
+    status: str = Field("success", description="Status string: 'success'")
+    engine: str = Field(..., description="Extraction engine identifier")
+    model: ModelInfo = Field(..., description="Model name and version")
+    taxonomy_version: str = Field(..., description="Echoed taxonomy schema version")
+    unit_id: str = Field(..., description="Echoed document unit ID")
+    window_index: int = Field(..., description="Echoed window index")
+    chars_in: int = Field(..., description="Total characters consumed from input window")
+    engine_latency_ms: float = Field(..., description="Model processing latency in milliseconds")
+    usage: TokenUsage = Field(..., description="Token usage breakdown")
+    fields_attempted: int = Field(..., description="Count of tags requested")
+    fields_returned: int = Field(..., description="Count of fields extracted")
+    fields_declined: int = Field(..., description="Count of tags declined due to lack of evidence")
+    fields: Dict[str, Any] = Field(..., description="Extracted metadata fields")
+
+
+# =============================================================================
+# METADATA EXTRACTION UTILITIES
+# =============================================================================
+
+def normalize_whitespace(text: str) -> str:
+    """Normalize whitespace by collapsing consecutive whitespace chars and stripping."""
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", str(text)).strip()
+
+
+def verify_evidence_spans(fields: dict, pages: list) -> dict:
+    """
+    Verifies all evidence spans in extracted fields against the request pages and blocks.
+    For every 'record' value, checks that quote appears verbatim (whitespace-normalised)
+    in the block text it sent.
+    """
+    block_lookup = {}
+    page_lookup = {}
+    for p in pages:
+        p_slug = str(p.get("page_slug", "") if isinstance(p, dict) else getattr(p, "page_slug", ""))
+        p_blocks = p.get("blocks", []) if isinstance(p, dict) else getattr(p, "blocks", [])
+        page_texts = []
+        for b in p_blocks:
+            b_id = str(b.get("id", "") if isinstance(b, dict) else getattr(b, "id", ""))
+            b_text = str(b.get("text", "") if isinstance(b, dict) else getattr(b, "text", ""))
+            block_lookup[(p_slug, b_id)] = normalize_whitespace(b_text)
+            page_texts.append(b_text)
+        page_lookup[p_slug] = normalize_whitespace(" ".join(page_texts))
+
+    span_details = []
+    total_record_values = 0
+    verified_spans = 0
+
+    for tag, field_obj in fields.items():
+        if not isinstance(field_obj, dict):
+            continue
+        val = field_obj.get("value")
+        if val is None:
+            continue
+
+        # Single-valued tag
+        if not isinstance(val, list):
+            source = field_obj.get("source", "record")
+            if source == "record":
+                total_record_values += 1
+                evidence_list = field_obj.get("evidence") or []
+                if not evidence_list:
+                    span_details.append({
+                        "tag": tag,
+                        "source": source,
+                        "verified": False,
+                        "reason": "Missing evidence array for record source"
+                    })
+                else:
+                    field_verified = True
+                    for ev in evidence_list:
+                        if not isinstance(ev, dict):
+                            continue
+                        p_slug = str(ev.get("page_slug", ""))
+                        b_id = str(ev.get("block_id", ""))
+                        quote = normalize_whitespace(str(ev.get("quote", "")))
+                        target_text = block_lookup.get((p_slug, b_id)) or page_lookup.get(p_slug, "")
+                        is_match = bool(quote and quote in target_text)
+                        if not is_match:
+                            field_verified = False
+                        span_details.append({
+                            "tag": tag,
+                            "page_slug": p_slug,
+                            "block_id": b_id,
+                            "quote": quote,
+                            "verified": is_match
+                        })
+                    if field_verified:
+                        verified_spans += 1
+
+        # Multi-valued entity list
+        else:
+            for entity in val:
+                if not isinstance(entity, dict):
+                    continue
+                source = entity.get("source", "record")
+                if source == "record":
+                    total_record_values += 1
+                    evidence_list = entity.get("evidence") or []
+                    if not evidence_list:
+                        span_details.append({
+                            "tag": tag,
+                            "label": entity.get("label"),
+                            "source": source,
+                            "verified": False,
+                            "reason": "Missing evidence array for record entity"
+                        })
+                    else:
+                        entity_verified = True
+                        for ev in evidence_list:
+                            if not isinstance(ev, dict):
+                                continue
+                            p_slug = str(ev.get("page_slug", ""))
+                            b_id = str(ev.get("block_id", ""))
+                            quote = normalize_whitespace(str(ev.get("quote", "")))
+                            target_text = block_lookup.get((p_slug, b_id)) or page_lookup.get(p_slug, "")
+                            is_match = bool(quote and quote in target_text)
+                            if not is_match:
+                                entity_verified = False
+                            span_details.append({
+                                "tag": tag,
+                                "label": entity.get("label"),
+                                "page_slug": p_slug,
+                                "block_id": b_id,
+                                "quote": quote,
+                                "verified": is_match
+                            })
+                        if entity_verified:
+                            verified_spans += 1
+
+    rate = round(verified_spans / total_record_values, 4) if total_record_values > 0 else 1.0
+    return {
+        "verified_spans_count": verified_spans,
+        "total_record_values_count": total_record_values,
+        "evidence_verified_rate": rate,
+        "span_details": span_details
+    }
+
+
+def compute_window_derived_metrics(
+    response_payload: dict,
+    request_payload: dict,
+    extraction_latency_ms: Optional[float] = None
+) -> dict:
+    """
+    Derives per-window metrics as specified in Section 3 of METADATA_API_Payload_Specification.md.
+    """
+    fields = response_payload.get("fields", {})
+    pages = request_payload.get("pages", [])
+
+    confidences = []
+    low_conf_count = 0
+    total_evidence_spans = 0
+
+    for tag, field_obj in fields.items():
+        if isinstance(field_obj, dict):
+            conf = field_obj.get("confidence")
+            if isinstance(conf, (int, float)):
+                conf_val = float(conf)
+                confidences.append(conf_val)
+                if conf_val < 0.7:
+                    low_conf_count += 1
+
+            ev = field_obj.get("evidence")
+            if isinstance(ev, list):
+                total_evidence_spans += len(ev)
+
+            val = field_obj.get("value")
+            if isinstance(val, list):
+                for item in val:
+                    if isinstance(item, dict):
+                        item_ev = item.get("evidence")
+                        if isinstance(item_ev, list):
+                            total_evidence_spans += len(item_ev)
+
+    mean_conf = round(sum(confidences) / len(confidences), 3) if confidences else None
+    min_conf = round(min(confidences), 3) if confidences else None
+
+    # Source OCR Confidence (Mean of non-null page_confidences)
+    page_confs = []
+    for p in pages:
+        ocr_c = p.get("ocr_confidence") if isinstance(p, dict) else getattr(p, "ocr_confidence", None)
+        if ocr_c is not None:
+            page_confs.append(float(ocr_c))
+
+    source_ocr_conf = round(sum(page_confs) / len(page_confs), 3) if page_confs else None
+
+    ev_verification = verify_evidence_spans(fields, pages)
+    engine_latency = response_payload.get("engine_latency_ms", 0.0)
+    wall_latency = extraction_latency_ms if extraction_latency_ms is not None else engine_latency
+
+    return {
+        "unit_id": response_payload.get("unit_id"),
+        "window_index": response_payload.get("window_index"),
+        "engine": response_payload.get("engine"),
+        "model": response_payload.get("model"),
+        "taxonomy_version": response_payload.get("taxonomy_version"),
+        "chars_in": response_payload.get("chars_in"),
+        "usage": response_payload.get("usage"),
+        "fields_attempted": response_payload.get("fields_attempted"),
+        "fields_returned": response_payload.get("fields_returned"),
+        "fields_declined": response_payload.get("fields_declined"),
+        "mean_field_confidence": mean_conf,
+        "min_field_confidence": min_conf,
+        "low_confidence_fields_count": low_conf_count,
+        "evidence_spans_count": total_evidence_spans,
+        "evidence_verified_rate": ev_verification["evidence_verified_rate"],
+        "source_ocr_confidence": source_ocr_conf,
+        "engine_latency_ms": engine_latency,
+        "extraction_latency_ms": wall_latency,
+        "verification_details": ev_verification["span_details"]
+    }
+
+
+def aggregate_document_metrics(
+    window_responses: list[dict],
+    total_pages: Optional[int] = None,
+    taxonomy_tags: Optional[list[str]] = None,
+    unit_id: Optional[str] = None,
+) -> dict:
+    """
+    Aggregates window responses into Full Document Aggregated Metrics (Section 5).
+    """
+    if not window_responses:
+        return {
+            "unit_id": unit_id or "",
+            "windows_total": 0,
+            "windows_completed": 0,
+            "pages_read": 0,
+            "pages_total": total_pages or 0,
+            "extraction_coverage": 0.0,
+            "field_coverage": 0.0,
+            "avg_confidence": None,
+            "min_confidence": None,
+            "fields_below_0_7": 0,
+            "evidence_verified_rate": None,
+            "total_prompt_tokens": 0,
+            "total_completion_tokens": 0,
+            "total_tokens": 0,
+            "avg_engine_latency_ms": 0.0,
+            "source_ocr_confidence": None,
+        }
+
+    first_win = window_responses[0]
+    effective_unit_id = unit_id or first_win.get("unit_id", "")
+    windows_completed = len(window_responses)
+    windows_total = first_win.get("window", {}).get("total", windows_completed) if isinstance(first_win.get("window"), dict) else windows_completed
+
+    all_confidences = []
+    low_conf_count = 0
+    all_filled_tags = set()
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    total_engine_latency = 0.0
+
+    for win in window_responses:
+        usage = win.get("usage", {})
+        total_prompt_tokens += usage.get("prompt_tokens", 0)
+        total_completion_tokens += usage.get("completion_tokens", 0)
+        total_engine_latency += win.get("engine_latency_ms", 0.0)
+
+        fields = win.get("fields", {})
+        for tag, fobj in fields.items():
+            if isinstance(fobj, dict) and fobj.get("value") is not None:
+                all_filled_tags.add(tag)
+                conf = fobj.get("confidence")
+                if isinstance(conf, (int, float)):
+                    conf_f = float(conf)
+                    all_confidences.append(conf_f)
+                    if conf_f < 0.7:
+                        low_conf_count += 1
+
+    avg_conf = round(sum(all_confidences) / len(all_confidences), 3) if all_confidences else None
+    min_conf = round(min(all_confidences), 3) if all_confidences else None
+    avg_engine_latency = round(total_engine_latency / windows_completed, 2) if windows_completed > 0 else 0.0
+
+    schema_tag_count = len(taxonomy_tags) if taxonomy_tags else max(1, len(all_filled_tags))
+    field_coverage = round(len(all_filled_tags) / schema_tag_count, 4) if schema_tag_count > 0 else 0.0
+
+    pages_read = total_pages or windows_completed
+    pages_total_count = total_pages or windows_total
+    extraction_coverage = round(pages_read / pages_total_count, 4) if pages_total_count > 0 else 1.0
+
+    return {
+        "unit_id": effective_unit_id,
+        "windows_total": windows_total,
+        "windows_completed": windows_completed,
+        "pages_read": pages_read,
+        "pages_total": pages_total_count,
+        "extraction_coverage": extraction_coverage,
+        "field_coverage": field_coverage,
+        "avg_confidence": avg_conf,
+        "min_confidence": min_conf,
+        "fields_below_0_7": low_conf_count,
+        "total_prompt_tokens": total_prompt_tokens,
+        "total_completion_tokens": total_completion_tokens,
+        "total_tokens": total_prompt_tokens + total_completion_tokens,
+        "avg_engine_latency_ms": avg_engine_latency,
+    }
+
+
+def build_metadata_extraction_prompt(request: MetadataRequest) -> tuple[str, str, int]:
+    """
+    Constructs the system prompt, user prompt, and calculates total characters consumed.
+    """
+    tags_list = request.tags or []
+    tags_str = ", ".join([f'"{t}"' for t in tags_list])
+    lang_hint_str = f"Language hints: {', '.join(request.language_hint)}\n" if request.language_hint else ""
+
+    system_prompt = (
+        "You are an archival metadata extraction system following the Kalanjiyam Metadata Extraction Specification (v1.0).\n"
+        "Your task is to analyze document text pages provided as typed blocks with IDs, and extract archival description metadata fields ONLY for the requested tags.\n\n"
+        "RULES:\n"
+        f"1. Target Tags: [{tags_str}]. You MUST NOT return any tag that is not in this list.\n"
+        "2. If evidence for a tag is present in the document text, extract it with appropriate field properties.\n"
+        "3. If evidence is NOT present, DECLINE the tag by omitting it entirely from the 'fields' object. Never hallucinate or invent values or tags.\n"
+        "4. Evidence and Provenance:\n"
+        "   - 'record': For facts directly stated in the text. MUST provide 'evidence' citing page_slug, block_id, and verbatim quote.\n"
+        "   - 'derived': For synthesised/summarised information (e.g. SCOPE CONTENT). Cite contributing page_slugs without block_id/quote.\n"
+        "   - 'enrichment': Sourced from external authority files.\n"
+        "5. Field Structure:\n"
+        "   - Single-valued tag (e.g. TITLE, DATE, SCOPE CONTENT):\n"
+        '     "TAG_NAME": {"value": "...", "confidence": 0.90, "source": "record", "evidence": [{"page_slug": "...", "block_id": "...", "quote": "..."}]}\n'
+        "   - Entity list tag (e.g. PERSON NAME, PLACE, SUBJECT):\n"
+        '     "PERSON NAME": {"confidence": 0.85, "value": [{"label": "...", "variants": [...], "dates": "...", "source": "record", "evidence": [{"page_slug": "...", "block_id": "...", "quote": "..."}]}]}\n'
+        "6. Quotes must match text in the specified block VERBATIM.\n"
+        "7. Output ONLY a single valid JSON object of the form: {\"fields\": { ... }}\n"
+    )
+
+    page_sections = []
+    total_chars = 0
+
+    for page in request.pages:
+        slug = str(page.page_slug)
+        conf_str = f" (OCR confidence: {page.ocr_confidence})" if page.ocr_confidence is not None else ""
+        page_header = f"=== Page Slug: {slug}{conf_str} ==="
+        block_lines = []
+        for block in page.blocks:
+            b_id = str(block.id)
+            b_type = str(block.type)
+            b_text = str(block.text or "")
+            total_chars += len(b_text)
+            block_lines.append(f"[Block id={b_id} type={b_type}] {b_text}")
+
+        page_sections.append(page_header + "\n" + "\n".join(block_lines))
+
+    doc_text = "\n\n".join(page_sections)
+    win_idx = request.window.index if request.window else 0
+    win_tot = request.window.total if request.window else 1
+    win_slugs = ", ".join(request.window.page_slugs) if request.window else ""
+
+    user_prompt = (
+        f"Unit ID: {request.unit_id}\n"
+        f"Window: Index {win_idx} of {win_tot} (Pages: {win_slugs})\n"
+        f"Taxonomy Version: {request.taxonomy_version}\n"
+        f"{lang_hint_str}"
+        f"Requested Tags: {tags_str}\n\n"
+        f"Document Content:\n"
+        f"{doc_text}\n\n"
+        f"Extract metadata fields for the requested tags. Output valid JSON with 'fields' object."
+    )
+
+    return system_prompt, user_prompt, total_chars
+
+
+def format_kalanjiyam_metadata_response(
+    raw_output: Any,
+    request: MetadataRequest,
+    chars_in: int,
+    engine_latency_ms: float,
+    prompt_tokens: int,
+    completion_tokens: int,
+    engine: str,
+    model_name: str,
+    model_version: str,
+) -> dict:
+    """
+    Validates, filters, and formats metadata extraction output to comply strictly with Specification v1.0.
+    """
+    parsed_json = extract_json_from_model_output(raw_output) if isinstance(raw_output, str) else raw_output
+    raw_fields = {}
+    if isinstance(parsed_json, dict):
+        if "fields" in parsed_json and isinstance(parsed_json["fields"], dict):
+            raw_fields = parsed_json["fields"]
+        else:
+            raw_fields = {k: v for k, v in parsed_json.items() if k not in (
+                "contract_version", "status", "engine", "model", "taxonomy_version",
+                "unit_id", "window_index", "chars_in", "engine_latency_ms", "usage",
+                "fields_attempted", "fields_returned", "fields_declined"
+            )}
+
+    validated_fields = {}
+    requested_tags_order = request.tags or []
+
+    for tag in requested_tags_order:
+        if tag in raw_fields and isinstance(raw_fields[tag], dict):
+            field_data = raw_fields[tag]
+            val = field_data.get("value")
+            if val is None:
+                continue
+
+            conf = field_data.get("confidence", 0.85)
+            try:
+                conf = float(conf)
+                conf = max(0.0, min(1.0, conf))
+            except (ValueError, TypeError):
+                conf = 0.85
+
+            field_obj = {
+                "confidence": round(conf, 2),
+            }
+
+            if isinstance(val, list):
+                cleaned_entities = []
+                for entity in val:
+                    if isinstance(entity, dict):
+                        ent_obj = {
+                            "label": str(entity.get("label", "")),
+                            "source": str(entity.get("source", "record")),
+                        }
+                        if "variants" in entity and isinstance(entity["variants"], list):
+                            ent_obj["variants"] = entity["variants"]
+                        if "dates" in entity and entity["dates"] is not None:
+                            ent_obj["dates"] = str(entity["dates"])
+                        if "auth_id" in entity and entity["auth_id"] is not None:
+                            ent_obj["auth_id"] = str(entity["auth_id"])
+                        if "note" in entity and entity["note"] is not None:
+                            ent_obj["note"] = str(entity["note"])
+                        if "evidence" in entity and isinstance(entity["evidence"], list):
+                            ent_obj["evidence"] = entity["evidence"]
+                        cleaned_entities.append(ent_obj)
+                    else:
+                        cleaned_entities.append(entity)
+                field_obj["value"] = cleaned_entities
+            else:
+                field_obj["value"] = val
+                if "source" in field_data:
+                    field_obj["source"] = str(field_data["source"])
+                else:
+                    field_obj["source"] = "record"
+                if "evidence" in field_data and isinstance(field_data["evidence"], list):
+                    field_obj["evidence"] = field_data["evidence"]
+
+            validated_fields[tag] = field_obj
+
+    fields_attempted = len(requested_tags_order)
+    fields_returned = len(validated_fields)
+    fields_declined = max(0, fields_attempted - fields_returned)
+    win_idx = request.window.index if request.window else 0
+
+    return {
+        "contract_version": "1.0",
+        "status": "success",
+        "engine": engine,
+        "model": {
+            "name": model_name,
+            "version": model_version,
+        },
+        "taxonomy_version": request.taxonomy_version,
+        "unit_id": request.unit_id,
+        "window_index": win_idx,
+        "chars_in": int(chars_in),
+        "engine_latency_ms": round(float(engine_latency_ms), 2),
+        "usage": {
+            "prompt_tokens": int(prompt_tokens),
+            "completion_tokens": int(completion_tokens),
+            "total_tokens": int(prompt_tokens + completion_tokens),
+        },
+        "fields_attempted": int(fields_attempted),
+        "fields_returned": int(fields_returned),
+        "fields_declined": int(fields_declined),
+        "fields": validated_fields,
+    }
 
 
 def convert_image_bytes_to_base64_uri(image_bytes: bytes) -> str:
@@ -1117,6 +1683,126 @@ def free_vram_manually():
     log("MANUAL FREE", "Received manual request to free VRAM...")
     gpu_manager.stop_backend()
     return {"status": "success", "message": "VRAM freed. Backend stopped."}
+
+
+# =============================================================================
+# METADATA EXTRACTION & METRICS ENDPOINTS (Contract v1.0)
+# =============================================================================
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Ensure HTTP error payloads strictly follow contract: {"status": "error", "detail": "..."}"""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"status": "error", "detail": exc.detail}
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Format validation errors with standard error contract."""
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"status": "error", "detail": str(exc)}
+    )
+
+
+@app.post("/v1/metadata", response_model=MetadataResponse)
+async def extract_metadata(
+    request_data: MetadataRequest,
+    engine: Optional[str] = None,
+    max_tokens: Optional[int] = None,
+):
+    """
+    Extract archival metadata fields and return single JSON payload with fields and window metrics.
+    Complies with Kalanjiyam Metadata Extraction API Response & Metrics Specification (v1.0).
+    """
+    if not request_data.pages:
+        raise HTTPException(status_code=400, detail="Request must contain at least one page.")
+
+    if not request_data.tags:
+        raise HTTPException(status_code=400, detail="Request must contain a non-empty list of tags.")
+
+    eff_max_tokens = max_tokens or request_data.max_tokens or 4500
+    if eff_max_tokens < 100:
+        eff_max_tokens = 4500
+
+    target_engine_name = engine or request_data.engine or DEFAULT_METADATA_ENGINE
+    target_engine = resolve_engine(target_engine_name)
+    engine_cfg = ENGINE_CONFIGS.get(target_engine, ENGINE_CONFIGS.get("gemma-4", ENGINE_CONFIGS["dots-ocr"]))
+
+    win_idx = request_data.window.index if request_data.window else 0
+    win_tot = request_data.window.total if request_data.window else 1
+    log("METADATA REQ", f"Processing unit '{request_data.unit_id}' window {win_idx}/{win_tot} (tags: {len(request_data.tags)}, pages: {len(request_data.pages)}, engine: {target_engine})")
+
+    system_prompt, user_prompt, chars_in = build_metadata_extraction_prompt(request_data)
+
+    async with request_semaphore:
+        gpu_manager.touch()
+        try:
+            backend = gpu_manager.start_backend(engine_id=target_engine)
+        except Exception as e:
+            log("REQ ERROR", f"GPU initialization failed for engine '{target_engine}': {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to initialize GPU model backend for '{target_engine}': {str(e)}")
+
+        start_time = time.perf_counter()
+        active_gpu = backend["gpu_idx"]
+        backend_url = f"http://localhost:{backend['port']}/v1/chat/completions"
+
+        payload = {
+            "model": MODEL_NAME,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "max_tokens": eff_max_tokens,
+            "temperature": 0.0
+        }
+
+        try:
+            response = await asyncio.to_thread(
+                requests.post, backend_url, json=payload, timeout=240
+            )
+            if response.status_code != 200:
+                log("REQ ERROR", f"vLLM backend returned status code {response.status_code}: {response.text}")
+                raise HTTPException(status_code=response.status_code, detail=f"vLLM server error: {response.text}")
+            res_json = response.json()
+        except requests.exceptions.RequestException as req_err:
+            log("REQ ERROR", f"HTTP connection to vLLM backend failed: {str(req_err)}")
+            raise HTTPException(status_code=502, detail=f"Backend request failed: {str(req_err)}")
+
+        choice = res_json.get("choices", [{}])[0]
+        finish_reason = choice.get("finish_reason")
+        content_text = choice.get("message", {}).get("content", "")
+
+        if finish_reason == "length":
+            log("METADATA WARN", f"Generation truncated for unit '{request_data.unit_id}' window {win_idx}")
+
+        end_time = time.perf_counter()
+        duration_seconds = max(0.001, end_time - start_time)
+        engine_latency_ms = round(duration_seconds * 1000.0, 2)
+
+        usage = res_json.get("usage", {})
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+
+        gpu_manager.touch()
+
+        formatted_resp = format_kalanjiyam_metadata_response(
+            raw_output=content_text,
+            request=request_data,
+            chars_in=chars_in,
+            engine_latency_ms=engine_latency_ms,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            engine=target_engine,
+            model_name=engine_cfg.get("model_name", "gemma-4-26b-a4b-it"),
+            model_version=engine_cfg.get("model_version", "1.0.0"),
+        )
+
+        log("METADATA SUCCESS", f"Finished unit '{request_data.unit_id}' window {win_idx} in {duration_seconds:.2f}s | Returned {formatted_resp['fields_returned']}/{formatted_resp['fields_attempted']} fields (declined {formatted_resp['fields_declined']}) | Tokens: {prompt_tokens} in / {completion_tokens} out")
+
+        return formatted_resp
 
 
 if __name__ == "__main__":

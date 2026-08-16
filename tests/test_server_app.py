@@ -224,16 +224,18 @@ def test_api_v1_ocr_endpoint_schema():
     assert resp.status_code == 200
     data = resp.json()
     assert data.get("status") == "ok"
-    assert data["engines"] == ["dots-ocr", "gemma-4"]
     assert "dots-ocr" in data["engines"]
     assert "gemma-4" in data["engines"]
+    assert "kalanjiyam-archival" in data["engines"]
     assert data["default_engine"] in data["engines"]
 
     # Also test /engines alias
     resp_alias = client.get("/engines")
     assert resp_alias.status_code == 200
     assert resp_alias.json().get("status") == "ok"
-    assert resp_alias.json()["engines"] == ["dots-ocr", "gemma-4"]
+    assert "dots-ocr" in resp_alias.json()["engines"]
+    assert "gemma-4" in resp_alias.json()["engines"]
+    assert "kalanjiyam-archival" in resp_alias.json()["engines"]
 
 
 def test_engine_resolution():

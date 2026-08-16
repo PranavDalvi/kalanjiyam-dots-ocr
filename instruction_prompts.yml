@@ -229,6 +229,36 @@ dotsocr_raw: |
   <|img|><|imgpad|><|endofimg|>
   extract the text content from this image.
 
+gemma4_ocr: |
+  Extract all text from this image faithfully.
+  - Preserve the original reading order, line breaks, and paragraph structures.
+  - Format tables in HTML or markdown.
+  - Format mathematical formulas in LaTeX.
+  - Do not translate or summarize. Output only the extracted text.
+
+gemma4_ocr_w_layout: |
+  You are an expert OCR and document understanding system.
+  Extract all layout elements, bounding boxes, categories, and text from the image.
+  
+  Output a single JSON object with a "blocks" list:
+  ```json
+  {
+    "blocks": [
+      {
+        "category": "title" | "section-header" | "text" | "table" | "formula" | "list-item" | "caption" | "footnote" | "page-header" | "page-footer",
+        "bbox": [x1, y1, x2, y2],
+        "text": "<extracted content>"
+      }
+    ]
+  }
+  ```
+  Constraints:
+  - Bounding box format: [x1, y1, x2, y2] normalized to 0-1000 scale.
+  - Sort elements by reading order.
+  - Format formulas in LaTeX and tables in HTML.
+  - Output ONLY valid JSON without conversational text.
+
+
 surya_dots_ensemble: |
   <｜begin▁of▁sentence｜>you are a document reconstruction specialist. you will be given two independent ocr outputs of the same document. each may contain recognition errors, missing segments, or formatting inconsistencies. your task is to reconcile them into a single, clean, and faithful reconstruction.
 

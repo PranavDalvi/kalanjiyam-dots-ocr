@@ -3,7 +3,15 @@ import io
 import math
 from PIL import Image
 from fastapi.testclient import TestClient
-from server_app import app, format_kalanjiyam_v2_response, _generate_word_spans, scale_bbox_to_pixels
+from server_app import (
+    app,
+    format_kalanjiyam_v2_response,
+    _generate_word_spans,
+    scale_bbox_to_pixels,
+    resolve_engine,
+    extract_json_from_model_output,
+    ENGINE_CONFIGS,
+)
 
 
 def create_dummy_image(width=1240, height=1754) -> bytes:
@@ -214,7 +222,117 @@ def test_api_v1_ocr_endpoint_schema():
     # GET /v1/engines
     resp = client.get("/v1/engines")
     assert resp.status_code == 200
-    assert resp.json() == {"engines": ["dots-ocr"]}
+    data = resp.json()
+    assert data.get("status") == "ok"
+    assert data["engines"] == ["dots-ocr", "gemma-4"]
+    assert "dots-ocr" in data["engines"]
+    assert "gemma-4" in data["engines"]
+    assert data["default_engine"] in data["engines"]
+
+    # Also test /engines alias
+    resp_alias = client.get("/engines")
+    assert resp_alias.status_code == 200
+    assert resp_alias.json().get("status") == "ok"
+    assert resp_alias.json()["engines"] == ["dots-ocr", "gemma-4"]
+
+
+def test_engine_resolution():
+    """Verify that various aliases resolve to canonical engine IDs."""
+    assert resolve_engine("dots-ocr") == "dots-ocr"
+    assert resolve_engine("dots_ocr") == "dots-ocr"
+    assert resolve_engine("dotsocr") == "dots-ocr"
+    assert resolve_engine("dots") == "dots-ocr"
+    assert resolve_engine("rednote-hilab/dots.ocr") == "dots-ocr"
+
+    assert resolve_engine("gemma-4") == "gemma-4"
+    assert resolve_engine("gemma-4-26b") == "gemma-4"
+    assert resolve_engine("gemma-4-26b-a4b-it") == "gemma-4"
+    assert resolve_engine("google/gemma-4-26B-A4B-it") == "gemma-4"
+    assert resolve_engine("gemma4") == "gemma-4"
+    assert resolve_engine("gemma") == "gemma-4"
+
+    # Default fallback when None or empty
+    assert resolve_engine(None) == "dots-ocr"
+    assert resolve_engine("") == "dots-ocr"
+
+
+def test_extract_json_from_model_output():
+    """Verify robust extraction of JSON from raw model output strings."""
+    # Direct JSON string
+    raw_json = '{"blocks": [{"category": "text", "bbox": [0, 0, 100, 100], "text": "Hello"}]}'
+    extracted = extract_json_from_model_output(raw_json)
+    assert isinstance(extracted, dict)
+    assert len(extracted["blocks"]) == 1
+
+    # JSON inside markdown code fence
+    markdown_fence = 'Here is the result:\n```json\n{"blocks": [{"category": "title", "bbox": [10, 10, 500, 50], "text": "Title"}]}\n```\nDone.'
+    extracted_fence = extract_json_from_model_output(markdown_fence)
+    assert isinstance(extracted_fence, dict)
+    assert extracted_fence["blocks"][0]["category"] == "title"
+
+    # JSON array inside text
+    array_text = 'OCR output:\n[{"category": "formula", "bbox": [50, 50, 200, 100], "text": "E = mc^2"}]'
+    extracted_arr = extract_json_from_model_output(array_text)
+    assert isinstance(extracted_arr, list)
+    assert extracted_arr[0]["category"] == "formula"
+
+    # Plain text fallback
+    plain = "This is just plain text with no JSON."
+    assert extract_json_from_model_output(plain) == plain
+
+
+def test_gemma4_response_format():
+    """Verify format_kalanjiyam_v2_response formatting for Gemma 4 engine."""
+    image_bytes = create_dummy_image(1200, 1600)
+    parsed_layout = {
+        "blocks": [
+            {
+                "category": "title",
+                "bbox": [100, 50, 900, 120],
+                "text": "Gemma 4 Document Title",
+                "confidence": 0.99
+            },
+            {
+                "category": "formula",
+                "bbox": [100, 150, 600, 250],
+                "text": "\\sum_{i=1}^n x_i",
+                "confidence": 0.97
+            }
+        ]
+    }
+
+    resp = format_kalanjiyam_v2_response(
+        parsed_layout=parsed_layout,
+        image_bytes=image_bytes,
+        filename="gemma_doc.jpg",
+        active_gpu=1,
+        language="en",
+        duration_seconds=0.45,
+        prompt_tokens=150,
+        completion_tokens=60,
+        throughput=133.3,
+        engine="gemma-4",
+    )
+
+    assert resp["contract_version"] == "2.1"
+    assert resp["engine"] == "gemma-4"
+    assert resp["model"]["name"] == "gemma-4-26b-a4b-it"
+    assert resp["page_width"] == 1200
+    assert resp["page_height"] == 1600
+    assert len(resp["blocks"]) == 2
+    assert resp["blocks"][0]["type"] == "heading"
+    assert resp["blocks"][1]["type"] == "equation"
+    assert resp["blocks"][1]["content"] == "\\sum_{i=1}^n x_i"
+
+
+def test_server_entrypoint_import():
+    """Verify server.py imports and exposes application components."""
+    import server
+    assert hasattr(server, "app")
+    assert hasattr(server, "gpu_manager")
+    assert hasattr(server, "ENGINE_CONFIGS")
+    assert "gemma-4" in server.ENGINE_CONFIGS
+
 
 
 def test_document_and_project_level_aggregation_simulation():

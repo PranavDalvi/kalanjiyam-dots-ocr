@@ -79,13 +79,45 @@ with `GPU_MEMORY_HEADROOM_MB` only if your host requires more headroom.
 
 ## API Endpoints Reference
 
-### 1. `POST /ocr` (Image-Only OCR Endpoint)
+### 1. `POST /ocr` or `POST /v1/ocr` (Image-Only OCR Endpoint)
 Processes an uploaded image file (`.png`, `.jpg`, `.jpeg`, `.webp`).
 
-* **URL**: `http://<SERVER_IP>:8887/ocr`
+* **URL**: `http://<SERVER_IP>:8887/ocr` (or `/v1/ocr`)
 * **Method**: `POST`
 * **Content-Type**: `multipart/form-data`
-* **Form Field**: `file` (or `image`)
+* **Form Fields**:
+  * `file` (or `image`): Image binary data (required)
+  * `engine`: Engine to use: `"dots-ocr"` (default) or `"gemma-4"` (optional)
+  * `language`: Language code (optional, e.g. `sa`, `en`, `hi`)
+  * `max_tokens`: Max generation tokens (optional, default `4096`)
+
+#### Engine Selection
+You can set the default engine at server start:
+```bash
+python server.py --engine gemma-4
+# or via environment variable
+DEFAULT_ENGINE=gemma-4 python server_app.py
+```
+Or specify the engine dynamically per request:
+```bash
+curl -X POST http://localhost:8887/ocr \
+  -F "file=@document.jpg" \
+  -F "engine=gemma-4"
+```
+
+#### Supported Engines Discovery (`GET /v1/engines`)
+Returns all supported engines and the currently active engine:
+```bash
+curl http://localhost:8887/v1/engines
+```
+```json
+{
+  "status": "ok",
+  "engines": ["dots-ocr", "gemma-4"],
+  "current_engine": "dots-ocr",
+  "default_engine": "dots-ocr"
+}
+```
 
 #### Sample Output Response (`POST /v1/ocr`) (v2.1 Contract)
 ```json

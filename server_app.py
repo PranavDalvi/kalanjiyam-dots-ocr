@@ -38,9 +38,10 @@ MIN_FREE_VRAM_MB = int(os.getenv("MIN_FREE_VRAM_MB", "36000"))
 GPU_MEMORY_HEADROOM_MB = int(os.getenv("GPU_MEMORY_HEADROOM_MB", "1024"))
 VLLM_PORT = int(os.getenv("VLLM_PORT", "8000"))
 VLLM_BASE_URL = f"http://localhost:{VLLM_PORT}/v1/chat/completions"
-MODEL_PATH = os.getenv("MODEL_PATH", "rednote-hilab/dots.ocr")
+MODEL_PATH = os.getenv("MODEL_PATH", "")
 MODEL_NAME = "model"
 DEBUG_BBOX = os.getenv("DEBUG_BBOX", "0").lower() in ("1", "true", "yes")
+DEFAULT_ENGINE = os.getenv("DEFAULT_ENGINE", os.getenv("ENGINE", "dots-ocr")).strip().lower()
 
 # Asyncio Semaphore to restrict maximum parallel in-flight OCR requests at API level
 request_semaphore = asyncio.Semaphore(API_MAX_CONCURRENT_REQUESTS)
@@ -63,6 +64,88 @@ DOTSOCR_PROMPT = """please output the layout information from the pdf image, inc
 
 5. final output: the entire output must be a single json object."""
 
+GEMMA4_OCR_PROMPT = """please output the layout information from the image, including each layout element's bbox, its category, and the corresponding text content within the bbox.
+
+1. bbox format: [x1, y1, x2, y2] normalized to 0-1000 scale.
+
+2. layout categories: the possible categories are ['caption', 'footnote', 'formula', 'list-item', 'page-footer', 'page-header', 'picture', 'section-header', 'table', 'text', 'title'].
+
+3. text extraction & formatting rules:
+    - picture: for the 'picture' category, the text field should be omitted.
+    - formula: format its text as latex.
+    - table: format its text as html.
+    - all others (text, title, etc.): format their text as markdown.
+
+4. constraints:
+    - the output text must be the original text from the image, with no translation.
+    - all layout elements must be sorted according to human reading order.
+
+5. final output: the entire output must be a single json object with a "blocks" array or direct array of layout items."""
+
+ENGINE_CONFIGS = {
+    "dots-ocr": {
+        "engine_id": "dots-ocr",
+        "aliases": ["dots-ocr", "dots_ocr", "dotsocr", "dots", "rednote-hilab/dots.ocr"],
+        "default_model_path": "rednote-hilab/dots.ocr",
+        "local_cache_dir": "/root/.cache/weights/DotsOCR",
+        "model_name": "dots-ocr",
+        "model_version": "4.0.0",
+        "requires_native_registration": True,
+        "prompt": DOTSOCR_PROMPT,
+        "min_free_vram_mb": MIN_FREE_VRAM_MB,
+    },
+    "gemma-4": {
+        "engine_id": "gemma-4",
+        "aliases": [
+            "gemma-4",
+            "gemma-4-26b",
+            "gemma-4-26b-a4b-it",
+            "gemma-4-26b-it",
+            "gemma4",
+            "google/gemma-4-26b-a4b-it",
+            "google/gemma-4-26b-a4b",
+            "google/gemma-4-26b-it",
+            "gemma",
+            "gemma-4-26b-a4b",
+        ],
+        "default_model_path": os.getenv("GEMMA4_MODEL_PATH", "google/gemma-4-26B-A4B-it"),
+        "local_cache_dir": "/root/.cache/weights/gemma-4-26B-A4B-it",
+        "model_name": "gemma-4-26b-a4b-it",
+        "model_version": "1.0.0",
+        "requires_native_registration": False,
+        "prompt": GEMMA4_OCR_PROMPT,
+        "min_free_vram_mb": int(os.getenv("GEMMA4_MIN_FREE_VRAM_MB", "30000")),
+    },
+}
+
+
+def resolve_engine(engine_name: Optional[str]) -> str:
+    """Resolve user-supplied engine name or alias to canonical engine ID."""
+    if not engine_name or not str(engine_name).strip():
+        # Fall back to default configured engine
+        cleaned_default = DEFAULT_ENGINE.strip().lower()
+        if cleaned_default in ENGINE_CONFIGS:
+            return cleaned_default
+        for eid, conf in ENGINE_CONFIGS.items():
+            if cleaned_default in [a.lower() for a in conf.get("aliases", [])]:
+                return eid
+        return "dots-ocr"
+
+    cleaned = str(engine_name).strip().lower()
+    for engine_id, conf in ENGINE_CONFIGS.items():
+        if cleaned == engine_id.lower() or cleaned in [a.lower() for a in conf.get("aliases", [])]:
+            return engine_id
+
+    # Keyword heuristics
+    if "gemma" in cleaned:
+        return "gemma-4"
+    if "dots" in cleaned:
+        return "dots-ocr"
+
+    # Default fallback
+    return "dots-ocr"
+
+
 
 def log(step: str, message: str):
     """Helper for formatted step-by-step console logging."""
@@ -74,40 +157,47 @@ def log(step: str, message: str):
 # GPU & PROCESS MANAGEMENT UTILITIES
 # =============================================================================
 
-def ensure_model_downloaded() -> str:
+def ensure_model_downloaded(engine_id: str = "dots-ocr") -> str:
     """
-    Ensures model weights are downloaded to a local directory, config.json
-    has auto_map entries, and vLLM's native registration is installed.
+    Ensures model weights are downloaded to a local directory.
+    If engine is dots-ocr, config.json auto_map and vLLM native registration are ensured.
     """
-    target_dir = "/root/.cache/weights/DotsOCR"
+    canonical_engine = resolve_engine(engine_id)
+    config = ENGINE_CONFIGS.get(canonical_engine, ENGINE_CONFIGS["dots-ocr"])
 
-    # If already downloaded, just verify config
+    target_dir = config["local_cache_dir"]
+    model_to_use = MODEL_PATH if MODEL_PATH else config["default_model_path"]
+
+    # If already a local directory with model files
+    if os.path.exists(model_to_use) and os.path.isdir(model_to_use) and os.path.exists(os.path.join(model_to_use, "config.json")):
+        if config["requires_native_registration"]:
+            _ensure_config_auto_map(model_to_use)
+            _install_vllm_native_registration(model_to_use)
+        return model_to_use
+
+    # If already downloaded in target cache folder
     if os.path.exists(target_dir) and os.path.exists(os.path.join(target_dir, "config.json")):
-        _ensure_config_auto_map(target_dir)
-        _install_vllm_native_registration(target_dir)
+        if config["requires_native_registration"]:
+            _ensure_config_auto_map(target_dir)
+            _install_vllm_native_registration(target_dir)
         return target_dir
 
-    # If MODEL_PATH is already a local directory with model files
-    if os.path.exists(MODEL_PATH) and os.path.isdir(MODEL_PATH) and os.path.exists(os.path.join(MODEL_PATH, "config.json")):
-        _ensure_config_auto_map(MODEL_PATH)
-        _install_vllm_native_registration(MODEL_PATH)
-        return MODEL_PATH
-
-    log("MODEL DOWNLOAD", f"Pre-downloading model '{MODEL_PATH}' to local folder '{target_dir}'...")
+    log("MODEL DOWNLOAD", f"Pre-downloading model '{model_to_use}' for engine '{canonical_engine}' to local folder '{target_dir}'...")
     try:
         from huggingface_hub import snapshot_download
         os.makedirs(target_dir, exist_ok=True)
         snapshot_download(
-            repo_id=MODEL_PATH,
+            repo_id=model_to_use,
             local_dir=target_dir
         )
         log("MODEL DOWNLOAD", "Model weights downloaded successfully to local folder!")
-        _ensure_config_auto_map(target_dir)
-        _install_vllm_native_registration(target_dir)
+        if config["requires_native_registration"]:
+            _ensure_config_auto_map(target_dir)
+            _install_vllm_native_registration(target_dir)
         return target_dir
     except Exception as e:
-        log("MODEL WARN", f"Snapshot download failed ({e}). Using raw path '{MODEL_PATH}'.")
-        return MODEL_PATH
+        log("MODEL WARN", f"Snapshot download failed ({e}). Using raw path '{model_to_use}'.")
+        return model_to_use
 
 
 def _ensure_config_auto_map(model_dir: str):
@@ -280,7 +370,7 @@ def get_gpu_info() -> list[dict]:
         return []
 
 
-def select_best_gpu(excluded_gpu_ids: set[int] | None = None, log_selection: bool = True) -> tuple[int, float]:
+def select_best_gpu(min_free_vram_mb: int = MIN_FREE_VRAM_MB, excluded_gpu_ids: set[int] | None = None, log_selection: bool = True) -> tuple[int, float]:
     """
     Select the GPU index with the most free VRAM and dynamically calculate a safe GPU memory utilization ratio.
     """
@@ -301,11 +391,11 @@ def select_best_gpu(excluded_gpu_ids: set[int] | None = None, log_selection: boo
             (gpu for gpu in gpus if gpu["index"] not in excluded_gpu_ids),
             key=lambda g: g["free_mb"], reverse=True,
         )
-    eligible_gpus = [gpu for gpu in sorted_gpus if gpu["free_mb"] >= MIN_FREE_VRAM_MB]
+    eligible_gpus = [gpu for gpu in sorted_gpus if gpu["free_mb"] >= min_free_vram_mb]
     if not eligible_gpus:
         gpu_description = f"GPU {PINNED_GPU_ID}" if PINNED_GPU_ID is not None else "any eligible GPU"
         raise RuntimeError(
-            f"No {gpu_description} has the required {MIN_FREE_VRAM_MB} MB free VRAM to load DotsOCR."
+            f"No {gpu_description} has the required {min_free_vram_mb} MB free VRAM to load engine."
         )
     best_gpu = eligible_gpus[0]
 
@@ -328,6 +418,7 @@ class GPUProcessManager:
 
     def __init__(self):
         self.backends = []
+        self.current_engine = None
         self.next_backend_index = 0
         self.last_active_timestamp = time.time()
         self.lock = threading.Lock()
@@ -358,12 +449,15 @@ class GPUProcessManager:
     def is_running(self) -> bool:
         return bool(self._healthy_backends())
 
-    def is_available(self) -> bool:
-        """A healthy loaded worker or enough free VRAM to load one on demand."""
-        if self.is_running():
+    def is_available(self, engine_id: str = "dots-ocr") -> bool:
+        """A healthy loaded worker for the given engine or enough free VRAM to load one on demand."""
+        canonical_engine = resolve_engine(engine_id)
+        if self.is_running() and self.current_engine == canonical_engine:
             return True
+        config = ENGINE_CONFIGS.get(canonical_engine, ENGINE_CONFIGS["dots-ocr"])
+        min_vram = config.get("min_free_vram_mb", MIN_FREE_VRAM_MB)
         try:
-            select_best_gpu(log_selection=False)
+            select_best_gpu(min_free_vram_mb=min_vram, log_selection=False)
             return True
         except RuntimeError:
             return False
@@ -377,16 +471,17 @@ class GPUProcessManager:
         return backend
 
     @staticmethod
-    def _stream_logs(proc, gpu_idx):
+    def _stream_logs(proc, gpu_idx, engine_id):
         for line in iter(proc.stdout.readline, ""):
             if not line:
                 break
-            print(f"[vLLM GPU {gpu_idx}] {line.strip()}", flush=True)
+            print(f"[vLLM GPU {gpu_idx} ({engine_id})] {line.strip()}", flush=True)
 
     def _stop_backends(self):
         for backend in self.backends:
             proc = backend["process"]
-            log("VRAM CLEANUP", f"Stopping vLLM process on GPU {backend['gpu_idx']}...")
+            engine_tag = backend.get("engine", "unknown")
+            log("VRAM CLEANUP", f"Stopping vLLM process on GPU {backend['gpu_idx']} (engine: {engine_tag})...")
             try:
                 if os.name != "nt":
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -395,25 +490,34 @@ class GPUProcessManager:
             except Exception as e:
                 log("VRAM WARN", f"Error stopping GPU {backend['gpu_idx']}: {e}")
         self.backends = []
+        self.current_engine = None
         self.next_backend_index = 0
 
-    def start_backend(self):
-        """Start GPU_COUNT independent single-GPU workers and return one for this request."""
+    def start_backend(self, engine_id: str = "dots-ocr"):
+        """Start GPU_COUNT independent single-GPU workers for engine_id and return one for this request."""
+        canonical_engine = resolve_engine(engine_id)
+        config = ENGINE_CONFIGS.get(canonical_engine, ENGINE_CONFIGS["dots-ocr"])
+
         with self.lock:
-            # Do not restart healthy models merely because another GPU failed.
-            if self.is_running():
+            # If healthy backend already running with the requested engine, return worker
+            if self.is_running() and self.current_engine == canonical_engine:
                 return self._next_backend()
 
+            # If switching engines or restarting dead workers, clean up first
             if self.backends:
+                if self.current_engine and self.current_engine != canonical_engine:
+                    log("ENGINE SWITCH", f"Switching active engine from '{self.current_engine}' to '{canonical_engine}'. Stopping current workers to release VRAM...")
                 self._stop_backends()
-            effective_model_path = ensure_model_downloaded()
+
+            effective_model_path = ensure_model_downloaded(canonical_engine)
             model_parent = os.path.dirname(effective_model_path)
             extra_paths = [effective_model_path, model_parent, "/workspace", "/root/.cache/weights"]
             pythonpath_str = ":".join(extra_paths) + ":" + os.environ.get("PYTHONPATH", "")
             selected_gpu_ids = set()
+            min_vram = config.get("min_free_vram_mb", MIN_FREE_VRAM_MB)
 
             for worker_index in range(GPU_COUNT):
-                gpu_idx, safe_utilization = select_best_gpu(selected_gpu_ids)
+                gpu_idx, safe_utilization = select_best_gpu(min_free_vram_mb=min_vram, excluded_gpu_ids=selected_gpu_ids)
                 selected_gpu_ids.add(gpu_idx)
                 port = VLLM_PORT + worker_index
                 env = os.environ.copy()
@@ -431,10 +535,10 @@ class GPUProcessManager:
                 ]
                 if VLLM_MAX_NUM_BATCHED_TOKENS:
                     cmd.extend(["--max-num-batched-tokens", VLLM_MAX_NUM_BATCHED_TOKENS])
-                log("BACKEND LAUNCH", f"Launching worker {worker_index + 1}/{GPU_COUNT} on GPU {gpu_idx}, port {port}, memory target {safe_utilization}.")
+                log("BACKEND LAUNCH", f"Launching {canonical_engine} worker {worker_index + 1}/{GPU_COUNT} on GPU {gpu_idx}, port {port}, memory target {safe_utilization}.")
                 proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, preexec_fn=os.setsid if os.name != "nt" else None)
-                backend = {"gpu_idx": gpu_idx, "port": port, "process": proc}
-                threading.Thread(target=self._stream_logs, args=(proc, gpu_idx), daemon=True).start()
+                backend = {"gpu_idx": gpu_idx, "port": port, "process": proc, "engine": canonical_engine}
+                threading.Thread(target=self._stream_logs, args=(proc, gpu_idx, canonical_engine), daemon=True).start()
 
                 start_wait = time.time()
                 while time.time() - start_wait < 300:
@@ -444,13 +548,14 @@ class GPUProcessManager:
                         break
                     time.sleep(3)
                 if not self._is_backend_running(backend):
-                    log("BACKEND WARN", f"GPU {gpu_idx} worker did not start. Keeping existing workers online and continuing with the remaining GPUs.")
+                    log("BACKEND WARN", f"GPU {gpu_idx} worker ({canonical_engine}) did not start. Keeping existing workers online and continuing with the remaining GPUs.")
                     continue
                 self.backends.append(backend)
-                log("BACKEND READY", f"vLLM worker is ready on GPU {gpu_idx}.")
+                log("BACKEND READY", f"vLLM worker ({canonical_engine}) is ready on GPU {gpu_idx}.")
 
             if not self.backends:
-                raise RuntimeError("No vLLM worker could start. Check the worker logs above.")
+                raise RuntimeError(f"No vLLM worker for '{canonical_engine}' could start. Check the worker logs above.")
+            self.current_engine = canonical_engine
             self.touch()
             return self._next_backend()
 
@@ -614,6 +719,54 @@ def _generate_word_spans(content: str, px_bbox: list[float], block_confidence: f
     return words_output
 
 
+def extract_json_from_model_output(text: str):
+    """
+    Attempts to extract JSON from raw model output, handling markdown code fences
+    (e.g., ```json ... ```) or embedded JSON objects/arrays.
+    """
+    if not isinstance(text, str):
+        return text
+    clean_text = text.strip()
+    # 1. Direct parse
+    try:
+        return json.loads(clean_text)
+    except Exception:
+        pass
+
+    # 2. Extract from markdown code fence
+    if "```" in clean_text:
+        import re
+        match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", clean_text)
+        if match:
+            code_content = match.group(1).strip()
+            try:
+                return json.loads(code_content)
+            except Exception:
+                pass
+
+    # 3. Find first { or [ to last } or ]
+    first_brace = clean_text.find("{")
+    first_bracket = clean_text.find("[")
+
+    start_idx = -1
+    if first_brace != -1 and (first_bracket == -1 or first_brace < first_bracket):
+        start_idx = first_brace
+        end_idx = clean_text.rfind("}")
+    elif first_bracket != -1:
+        start_idx = first_bracket
+        end_idx = clean_text.rfind("]")
+    else:
+        end_idx = -1
+
+    if start_idx != -1 and end_idx > start_idx:
+        try:
+            return json.loads(clean_text[start_idx:end_idx + 1])
+        except Exception:
+            pass
+
+    return clean_text
+
+
 def format_kalanjiyam_v2_response(
     parsed_layout,
     image_bytes: bytes,
@@ -625,8 +778,10 @@ def format_kalanjiyam_v2_response(
     completion_tokens: int,
     throughput: float,
     engine: Optional[str] = None,
+    model_name: Optional[str] = None,
+    model_version: Optional[str] = None,
 ) -> dict:
-    """Formats DotsOCR outputs into the Kalanjiyam OCR Service Contract (v2.1) JSON response."""
+    """Formats DotsOCR / Gemma-4 outputs into the Kalanjiyam OCR Service Contract (v2.1) JSON response."""
     page_width, page_height = 1000, 1000
     try:
         img = Image.open(io.BytesIO(image_bytes))
@@ -728,13 +883,23 @@ def format_kalanjiyam_v2_response(
     engine_latency_ms = round(duration_seconds * 1000.0, 2)
     selected_engine = (engine or "dots_ocr").strip()
 
+    if not model_name:
+        if "gemma" in selected_engine.lower():
+            model_name = "gemma-4-26b-a4b-it"
+            model_version = model_version or "1.0.0"
+        else:
+            model_name = "dots-ocr"
+            model_version = model_version or "4.0.0"
+    else:
+        model_version = model_version or "4.0.0"
+
     result_payload = {
         # Kalanjiyam OCR Service Contract (v2.1) required fields
         "contract_version": "2.1",
         "engine": selected_engine,
         "model": {
-            "name": "dots-ocr",
-            "version": "4.0.0"
+            "name": model_name,
+            "version": model_version
         },
         "page_confidence": page_confidence,
         "engine_latency_ms": engine_latency_ms,
@@ -776,10 +941,16 @@ def format_kalanjiyam_v2_response(
     return result_payload
 
 
+@app.get("/engines")
 @app.get("/v1/engines")
 def get_engines():
     """Returns list of active engines for Kalanjiyam service discovery."""
-    return {"engines": ["dots-ocr"]}
+    return {
+        "status": "ok",
+        "engines": list(ENGINE_CONFIGS.keys()),
+        "current_engine": gpu_manager.current_engine or DEFAULT_ENGINE,
+        "default_engine": DEFAULT_ENGINE,
+    }
 
 
 @app.get("/gpu-status")
@@ -792,6 +963,9 @@ def gpu_status():
         "active_gpus": gpu_manager.active_gpus,
         "gpu_count_configured": GPU_COUNT,
         "backend_running": gpu_manager.is_running(),
+        "current_engine": gpu_manager.current_engine,
+        "default_engine": DEFAULT_ENGINE,
+        "available_engines": list(ENGINE_CONFIGS.keys()),
         "api_max_concurrent_limit": API_MAX_CONCURRENT_REQUESTS,
         "vllm_max_num_seqs": VLLM_MAX_NUM_SEQS,
         "idle_seconds": round(time.time() - gpu_manager.last_active_timestamp, 1),
@@ -801,17 +975,21 @@ def gpu_status():
 
 
 @app.get("/health")
-def health_check():
+def health_check(engine: Optional[str] = None):
     """Health check endpoint."""
-    available = gpu_manager.is_available()
+    target_engine = resolve_engine(engine)
+    available = gpu_manager.is_available(target_engine)
     payload = {
         "status": "healthy" if available else "unavailable",
         "backend_running": gpu_manager.is_running(),
+        "current_engine": gpu_manager.current_engine,
+        "checked_engine": target_engine,
+        "default_engine": DEFAULT_ENGINE,
         "active_gpus": gpu_manager.active_gpus,
         "gpu_count_configured": GPU_COUNT,
         "api_max_concurrent_limit": API_MAX_CONCURRENT_REQUESTS,
         "vllm_max_num_seqs": VLLM_MAX_NUM_SEQS,
-        "min_free_vram_mb": MIN_FREE_VRAM_MB,
+        "min_free_vram_mb": ENGINE_CONFIGS[target_engine]["min_free_vram_mb"],
     }
     return JSONResponse(status_code=200 if available else 503, content=payload)
 
@@ -821,7 +999,7 @@ def health_check():
 async def run_ocr(
     file: Optional[UploadFile] = File(None, description="Image file (PNG, JPG, JPEG, WEBP)"),
     image: Optional[UploadFile] = File(None, description="Alternative field name for image file"),
-    engine: Optional[str] = Form(None, description="OCR engine name"),
+    engine: Optional[str] = Form(None, description="OCR engine name ('dots-ocr' or 'gemma-4')"),
     language: Optional[str] = Form(None, description="Language code (e.g. sa, en, hi)"),
     max_tokens: Optional[int] = Form(None, description="Max generation tokens")
 ):
@@ -839,16 +1017,18 @@ async def run_ocr(
 
     eff_max_tokens = max_tokens if (max_tokens is not None and max_tokens > 0) else 4096
 
+    target_engine = resolve_engine(engine)
+    engine_cfg = ENGINE_CONFIGS[target_engine]
     filename = target_file.filename or "uploaded_image.jpg"
-    log("REQ RECEIVED", f"Processing image: '{filename}' (engine: {engine or 'dots-ocr'}, language: {language or 'sa'}, max_tokens: {eff_max_tokens})")
+    log("REQ RECEIVED", f"Processing image: '{filename}' (engine: {target_engine}, language: {language or 'sa'}, max_tokens: {eff_max_tokens})")
 
     async with request_semaphore:
         gpu_manager.touch()
         try:
-            backend = gpu_manager.start_backend()
+            backend = gpu_manager.start_backend(engine_id=target_engine)
         except Exception as e:
-            log("REQ ERROR", f"GPU initialization failed: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Failed to initialize GPU model backend: {str(e)}")
+            log("REQ ERROR", f"GPU initialization failed for engine '{target_engine}': {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to initialize GPU model backend for '{target_engine}': {str(e)}")
 
         log("PREPROCESSING", f"Reading image bytes for '{filename}'...")
         file_bytes = await target_file.read()
@@ -865,7 +1045,7 @@ async def run_ocr(
 
         active_gpu = backend["gpu_idx"]
         backend_url = f"http://localhost:{backend['port']}/v1/chat/completions"
-        log("INFERENCE START", f"Sending vision request for '{filename}' to vLLM engine on GPU {active_gpu}...")
+        log("INFERENCE START", f"Sending vision request for '{filename}' to vLLM engine ({target_engine}) on GPU {active_gpu}...")
 
         payload = {
             "model": MODEL_NAME,
@@ -874,7 +1054,7 @@ async def run_ocr(
                     "role": "user",
                     "content": [
                         {"type": "image_url", "image_url": {"url": img_uri}},
-                        {"type": "text", "text": DOTSOCR_PROMPT}
+                        {"type": "text", "text": engine_cfg["prompt"]}
                     ]
                 }
             ],
@@ -901,11 +1081,7 @@ async def run_ocr(
         if DEBUG_BBOX:
             log("DEBUG_BBOX", f"Raw Model Output for '{filename}':\n{content_text}")
 
-        parsed_layout = None
-        try:
-            parsed_layout = json.loads(content_text)
-        except json.JSONDecodeError:
-            parsed_layout = content_text
+        parsed_layout = extract_json_from_model_output(content_text)
 
         usage = res_json.get("usage", {})
         prompt_tokens = usage.get("prompt_tokens", 0)
@@ -917,7 +1093,7 @@ async def run_ocr(
 
         gpu_manager.touch()
 
-        log("INFERENCE SUCCESS", f"Finished '{filename}' in {duration_seconds}s | Tokens: {prompt_tokens} in / {completion_tokens} out | Speed: {throughput} tok/s")
+        log("INFERENCE SUCCESS", f"Finished '{filename}' [{target_engine}] in {duration_seconds}s | Tokens: {prompt_tokens} in / {completion_tokens} out | Speed: {throughput} tok/s")
 
         return format_kalanjiyam_v2_response(
             parsed_layout=parsed_layout,
@@ -929,7 +1105,9 @@ async def run_ocr(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             throughput=throughput,
-            engine=engine,
+            engine=engine if (engine and engine.strip()) else target_engine,
+            model_name=engine_cfg.get("model_name"),
+            model_version=engine_cfg.get("model_version"),
         )
 
 
@@ -942,7 +1120,22 @@ def free_vram_manually():
 
 
 if __name__ == "__main__":
+    import argparse
     import uvicorn
-    port = int(os.getenv("FASTAPI_PORT", "8887"))
-    log("SERVER START", f"Starting DotsOCR API server on port {port}...")
-    uvicorn.run("server_app:app", host="0.0.0.0", port=port, reload=False)
+
+    parser = argparse.ArgumentParser(description="Kalanjiyam DotsOCR & Gemma-4 API Service")
+    parser.add_argument("--host", default="0.0.0.0", help="Host address to bind to")
+    parser.add_argument("--port", type=int, default=int(os.getenv("FASTAPI_PORT", "8887")), help="Port to run FastAPI service on")
+    parser.add_argument("--engine", default=DEFAULT_ENGINE, help="Default OCR engine ('dots-ocr' or 'gemma-4')")
+    parser.add_argument("--model-path", default=None, help="Custom model path override")
+    args = parser.parse_args()
+
+    if args.engine:
+        DEFAULT_ENGINE = resolve_engine(args.engine)
+        os.environ["DEFAULT_ENGINE"] = DEFAULT_ENGINE
+    if args.model_path:
+        MODEL_PATH = args.model_path
+        os.environ["MODEL_PATH"] = args.model_path
+
+    log("SERVER START", f"Starting OCR API server on {args.host}:{args.port} (default engine: {DEFAULT_ENGINE})...")
+    uvicorn.run("server_app:app", host=args.host, port=args.port, reload=False)

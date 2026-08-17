@@ -12,24 +12,31 @@ else
   COMPOSE_CMD="docker-compose"
 fi
 
-MODEL_HOST_PATH="rednote-hilab/dots.ocr"
-GEMMA_MODEL_HOST_PATH="google/gemma-4-26B-A4B-it"
+MODEL_HOST_PATH="${HOST_MODEL_PATH:-rednote-hilab/dots.ocr}"
+GEMMA_MODEL_HOST_PATH="${GEMMA4_MODEL_PATH:-google/gemma-4-26B-A4B-it}"
 ACTION=""
 
-if [[ "$1" == "start" || "$1" == "stop" || "$1" == "logs" || "$1" == "status" || "$1" == "start-multi" || "$1" == "stop-multi" || "$1" == "logs-multi" || "$1" == "status-multi" ]]; then
+if [[ "$1" =~ ^(start|stop|restart|rebuild|build|logs|status|health|start-single|stop-single|logs-single|start-multi|stop-multi|logs-multi|status-multi)$ ]]; then
   ACTION="$1"
-elif [[ "$2" == "start" || "$2" == "stop" || "$2" == "logs" || "$2" == "status" || "$2" == "start-multi" || "$2" == "stop-multi" || "$2" == "logs-multi" || "$2" == "status-multi" ]]; then
+elif [[ "$2" =~ ^(start|stop|restart|rebuild|build|logs|status|health|start-single|stop-single|logs-single|start-multi|stop-multi|logs-multi|status-multi)$ ]]; then
   MODEL_HOST_PATH="$1"
   ACTION="$2"
 else
   ACTION="$1"
 fi
 
+export HOST_MODEL_PATH="$MODEL_HOST_PATH"
+export GEMMA4_MODEL_PATH="$GEMMA_MODEL_HOST_PATH"
+
 case "$ACTION" in
+  build|rebuild)
+    echo "[Docker Manager] Building all container images with --no-cache using uv..."
+    $COMPOSE_CMD build --no-cache
+    echo "[Docker Manager] Build complete."
+    ;;
+
   start)
     echo "[Docker Manager] Building and starting Gateway + 2 Workers (DotsOCR on GPU 0, Gemma on GPU 1)..."
-    export HOST_MODEL_PATH="$MODEL_HOST_PATH"
-    export GEMMA4_MODEL_PATH="$GEMMA_MODEL_HOST_PATH"
     $COMPOSE_CMD up -d --build
     echo ""
     echo "======================================================================"
@@ -43,6 +50,12 @@ case "$ACTION" in
     echo "======================================================================"
     ;;
 
+  restart)
+    echo "[Docker Manager] Restarting all services..."
+    $COMPOSE_CMD down
+    $COMPOSE_CMD up -d --build
+    ;;
+
   stop)
     echo "[Docker Manager] Stopping all OCR containers and Gateway..."
     $COMPOSE_CMD down
@@ -53,7 +66,7 @@ case "$ACTION" in
     $COMPOSE_CMD logs -f
     ;;
 
-  status)
+  status|health)
     $COMPOSE_CMD ps
     echo ""
     echo "[Health & Engine Status]:"
@@ -63,9 +76,35 @@ case "$ACTION" in
     curl -s http://localhost:8887/gpu-status | python3 -m json.tool || true
     ;;
 
+  start-single)
+    echo "[Docker Manager] Building and starting Standalone Single Container on Port 8887..."
+    docker build --no-cache -t dotsocr-fastapi-service:latest -f Dockerfile .
+    docker rm -f dotsocr_standalone 2>/dev/null || true
+    docker run -d \
+      --name dotsocr_standalone \
+      --gpus all \
+      --network host \
+      -v ~/.cache/huggingface:/root/.cache/huggingface \
+      -v "$(pwd)":/workspace \
+      -e MODEL_PATH="$HOST_MODEL_PATH" \
+      -e GEMMA4_MODEL_PATH="$GEMMA_MODEL_HOST_PATH" \
+      -e FASTAPI_PORT=8887 \
+      -e VLLM_PORT=8000 \
+      dotsocr-fastapi-service:latest
+    echo "[Docker Manager] Standalone container online at http://localhost:8887"
+    ;;
+
+  stop-single)
+    echo "[Docker Manager] Stopping Standalone Single Container..."
+    docker rm -f dotsocr_standalone 2>/dev/null || true
+    ;;
+
+  logs-single)
+    docker logs -f dotsocr_standalone
+    ;;
+
   start-multi)
     echo "[Docker Manager] Building and starting four pinned DotsOCR GPU workers with a router on port 8887..."
-    export HOST_MODEL_PATH="$MODEL_HOST_PATH"
     $COMPOSE_CMD -f docker-compose.multi-gpu.yml up -d --build
     echo "[Docker Manager] Multi-GPU OCR API is available at http://localhost:8887/v1/ocr"
     ;;
@@ -85,12 +124,20 @@ case "$ACTION" in
     ;;
 
   *)
-    echo "Usage:"
-    echo "  bash run_docker.sh start         # Start Gateway + DotsOCR (GPU 0) + Gemma (GPU 1)"
-    echo "  bash run_docker.sh stop          # Stop all containers"
-    echo "  bash run_docker.sh logs          # Tail logs for all containers"
-    echo "  bash run_docker.sh status        # Check status and health"
-    echo "  bash run_docker.sh start-multi   # 4-GPU DotsOCR dedicated cluster"
+    echo "Usage: bash run_docker.sh <command>"
+    echo ""
+    echo "Commands:"
+    echo "  start         # Build & start Gateway + DotsOCR Worker + Gemma Worker (docker-compose)"
+    echo "  stop          # Stop all compose containers"
+    echo "  restart       # Restart all compose containers"
+    echo "  rebuild       # Rebuild all images with --no-cache and uv"
+    echo "  logs          # Tail logs for all compose containers"
+    echo "  status        # Check status and engine discovery"
+    echo "  start-single  # Run standalone single-container service on port 8887"
+    echo "  stop-single   # Stop standalone single-container"
+    echo "  logs-single   # Tail logs for standalone single-container"
+    echo "  start-multi   # 4-GPU DotsOCR dedicated cluster"
+    echo "  stop-multi    # Stop 4-GPU DotsOCR dedicated cluster"
     exit 1
     ;;
 esac

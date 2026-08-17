@@ -3,14 +3,16 @@ FROM vllm/vllm-openai:latest
 
 WORKDIR /workspace
 
-# Install API dependencies and latest transformers
+# Install git and latest transformers from source for Gemma 4 (gemma4) architecture support
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+
 RUN pip install --no-cache-dir \
-    fastapi \
-    uvicorn \
     pymupdf \
     pillow \
     requests \
-    --upgrade transformers accelerate
+    "fastapi<0.137.0" \
+    git+https://github.com/huggingface/transformers.git \
+    accelerate
 
 # Copy application source code
 COPY server_app.py /workspace/server_app.py

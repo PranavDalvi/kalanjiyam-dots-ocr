@@ -304,6 +304,7 @@ def _patch_vllm_weight_loader():
     """
     Patches vLLM default_weight_loader to gracefully adapt heterogeneous 1D norm parameters
     (e.g., sliding-window 256 vs global-attention 512 in Gemma 4) instead of raising AssertionError.
+    Replaces the entire function definition cleanly with syntax verification.
     """
     try:
         import vllm.model_executor.model_loader.weight_utils as wu
@@ -314,29 +315,42 @@ def _patch_vllm_weight_loader():
         with open(wu_path, "r") as f:
             content = f.read()
 
-        correct_patch = (
-            "    if param.size() != loaded_weight.size():\n"
-            "        if len(param.shape) == 1 and len(loaded_weight.shape) == 1:\n"
-            "            param.data = loaded_weight.to(device=param.device, dtype=param.dtype)\n"
-            "            return\n"
-            "    assert param.size() == loaded_weight.size(), ("
-        )
+        import re, py_compile, tempfile
 
-        import re
-        broken_pattern = r"[ \t]*if param\.size\(\) != loaded_weight\.size\(\):[\s\S]*?assert param\.size\(\) == loaded_weight\.size\(\), \("
-        if re.search(broken_pattern, content):
-            content = re.sub(broken_pattern, correct_patch.strip("\n"), content, count=1)
-            with open(wu_path, "w") as f:
-                f.write(content)
-            log("PATCH", f"Repaired and verified vLLM default_weight_loader in '{wu_path}'.")
-            return
+        # Clean replacement of default_weight_loader
+        func_pattern = r"def default_weight_loader\(param:.*?\n(?=(?:def |\Z))"
+        clean_func = '''def default_weight_loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor) -> None:
+    """Loads a single weight tensor into a parameter with heterogeneous support."""
+    try:
+        if param.size() != loaded_weight.size():
+            if len(param.shape) == 1 and len(loaded_weight.shape) == 1:
+                param.data = loaded_weight.to(device=param.device, dtype=param.dtype)
+                return
+        param.data.copy_(loaded_weight)
+    except Exception as e:
+        if param.size() == loaded_weight.size():
+            param.data.copy_(loaded_weight)
+        else:
+            raise e
+'''
 
-        pattern = r"([ \t]*)assert param\.size\(\) == loaded_weight\.size\(\), \("
-        if re.search(pattern, content):
-            content = re.sub(pattern, correct_patch.strip("\n"), content, count=1)
-            with open(wu_path, "w") as f:
-                f.write(content)
-            log("PATCH", f"Successfully patched vLLM default_weight_loader in '{wu_path}' for heterogeneous Gemma-4 layers.")
+        if re.search(func_pattern, content, re.DOTALL):
+            new_content = re.sub(func_pattern, clean_func + "\n", content, count=1, flags=re.DOTALL)
+
+            # Verify syntax with py_compile before writing
+            with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tmp:
+                tmp.write(new_content)
+                tmp_path = tmp.name
+            try:
+                py_compile.compile(tmp_path, doraise=True)
+                with open(wu_path, "w") as f:
+                    f.write(new_content)
+                log("PATCH", f"Successfully patched default_weight_loader in '{wu_path}'.")
+            except Exception as pe:
+                log("PATCH WARN", f"Syntax verification failed: {pe}")
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
     except Exception as e:
         log("PATCH WARN", f"Could not patch vLLM weight loader: {e}")
 
@@ -360,6 +374,11 @@ def _patch_transformers_register():
                 log("PATCH", f"Patched transformers configuration_auto in '{cfg_auto_path}' to allow duplicate model registration.")
     except Exception as e:
         log("PATCH WARN", f"Could not patch transformers config registration: {e}")
+
+
+# Run critical runtime patches at import time
+_patch_vllm_weight_loader()
+_patch_transformers_register()
 
 
 def _ensure_config_auto_map(model_dir: str):

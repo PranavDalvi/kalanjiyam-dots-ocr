@@ -7,9 +7,9 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 # Set working directory
 WORKDIR /workspace
 
-# Install git and latest transformers for Gemma 4 (gemma4) architecture support
+# Install apt-utils, git, and latest transformers for Gemma 4 (gemma4) architecture support
 RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends apt-utils git && \
     rm -rf /var/lib/apt/lists/*
 
 # Install API service dependencies using uv

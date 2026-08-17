@@ -610,13 +610,6 @@ class GPUProcessManager:
             min_vram = config.get("min_free_vram_mb", MIN_FREE_VRAM_MB)
 
             tp_size = _env_int("TENSOR_PARALLEL_SIZE", _env_int(f"{canonical_engine.upper().replace('-', '_')}_TP_SIZE", 1))
-            if canonical_engine == "gemma-4" and tp_size == 1 and not os.getenv("TENSOR_PARALLEL_SIZE") and not os.getenv("GEMMA4_TP_SIZE"):
-                available_gpus = get_gpu_info()
-                max_free_single_gpu = max([g["free_mb"] for g in available_gpus], default=0)
-                # On cards with < 60GB VRAM (e.g. 48GB A6000), unquantized 26B needs TP=2.
-                # On 80GB cards (e.g. H100 SXM/NVL with >60GB free), it runs comfortably on TP=1.
-                if max_free_single_gpu < 60000 and len(available_gpus) >= 2 and not os.getenv("VLLM_QUANTIZATION"):
-                    tp_size = 2
 
             for worker_index in range(GPU_COUNT):
                 worker_gpu_ids = []

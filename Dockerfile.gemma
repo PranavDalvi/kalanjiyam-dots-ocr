@@ -1,0 +1,30 @@
+# Base image: Official vLLM image with modern PyTorch and CUDA
+FROM vllm/vllm-openai:latest
+
+WORKDIR /workspace
+
+# Install API dependencies and latest transformers
+RUN pip install --no-cache-dir \
+    fastapi \
+    uvicorn \
+    pymupdf \
+    pillow \
+    requests \
+    --upgrade transformers accelerate
+
+# Copy application source code
+COPY server_app.py /workspace/server_app.py
+COPY instruction_prompts.yml /workspace/instruction_prompts.yml
+
+# Environment defaults for Gemma Worker
+ENV DEFAULT_ENGINE=gemma-4
+ENV GEMMA4_MODEL_PATH=google/gemma-4-26B-A4B-it
+ENV FASTAPI_PORT=18888
+ENV VLLM_PORT=18001
+ENV GPU_COUNT=1
+ENV GPU_MEMORY_UTILIZATION=0.90
+ENV IDLE_TIMEOUT_SECONDS=1800
+
+EXPOSE 18888 18001
+
+ENTRYPOINT ["python3", "server_app.py"]

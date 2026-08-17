@@ -1,0 +1,19 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir \
+    fastapi \
+    uvicorn \
+    httpx \
+    python-multipart
+
+COPY gateway.py /app/gateway.py
+
+ENV GATEWAY_PORT=8887
+ENV DOTSOCR_WORKER_URL=http://127.0.0.1:18887
+ENV GEMMA_WORKER_URL=http://127.0.0.1:18888
+
+EXPOSE 8887
+
+ENTRYPOINT ["python3", "gateway.py"]

@@ -1,26 +1,25 @@
 services:
-  dotsocr-api:
+  # DotsOCR Worker Service (Dynamic GPU Selection across all 4 GPUs)
+  dotsocr-worker:
     build:
       context: .
       dockerfile: Dockerfile
     image: dotsocr-fastapi-service:latest
-    container_name: dotsocr_api_service
+    container_name: dotsocr_worker
     restart: unless-stopped
     network_mode: "host"
     environment:
       - MODEL_PATH=${HOST_MODEL_PATH:-rednote-hilab/dots.ocr}
-      # Keep one OCR generation on the A6000 at a time; callers can queue here.
+      # If PINNED_GPU_ID is empty, it dynamically picks whichever GPU has the most free VRAM
+      - PINNED_GPU_ID=${DOTSOCR_GPU_ID:-}
+      - GPU_COUNT=${DOTSOCR_GPU_COUNT:-1}
+      - FASTAPI_PORT=18887
+      - VLLM_PORT=18000
+      - DEFAULT_ENGINE=dots-ocr
+      - GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.90}
       - API_MAX_CONCURRENT_REQUESTS=${API_MAX_CONCURRENT_REQUESTS:-8}
       - VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-1}
-      # Optional: set after benchmarking (for example, 8192 or 16384).
-      - VLLM_MAX_NUM_BATCHED_TOKENS=${VLLM_MAX_NUM_BATCHED_TOKENS:-}
-      - GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.90}
-      # Number of independent one-GPU vLLM workers (1 through the available GPU count).
-      - GPU_COUNT=${GPU_COUNT:-1}
       - IDLE_TIMEOUT_SECONDS=1800
-      - FASTAPI_PORT=8887
-      # Base internal vLLM port; multi-GPU workers use this port and the next ports.
-      - VLLM_PORT=${VLLM_PORT:-8000}
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
       - .:/workspace
@@ -31,3 +30,52 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  # Gemma Worker Service (Dynamic GPU Selection across all 4 GPUs)
+  gemma-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.gemma
+    image: gemma-fastapi-service:latest
+    container_name: gemma_worker
+    restart: unless-stopped
+    network_mode: "host"
+    environment:
+      - GEMMA4_MODEL_PATH=${GEMMA4_MODEL_PATH:-google/gemma-4-26B-A4B-it}
+      # If PINNED_GPU_ID is empty, it dynamically picks whichever GPU has the most free VRAM
+      - PINNED_GPU_ID=${GEMMA_GPU_ID:-}
+      - GPU_COUNT=${GEMMA_GPU_COUNT:-1}
+      - FASTAPI_PORT=18888
+      - VLLM_PORT=18001
+      - DEFAULT_ENGINE=gemma-4
+      - GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.90}
+      - API_MAX_CONCURRENT_REQUESTS=${API_MAX_CONCURRENT_REQUESTS:-8}
+      - VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-1}
+      - IDLE_TIMEOUT_SECONDS=1800
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+      - .:/workspace
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Unified API Gateway on Port 8887
+  api-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    image: kalanjiyam-ocr-gateway:latest
+    container_name: ocr_gateway_8887
+    restart: unless-stopped
+    network_mode: "host"
+    environment:
+      - GATEWAY_PORT=8887
+      - DOTSOCR_WORKER_URL=http://127.0.0.1:18887
+      - GEMMA_WORKER_URL=http://127.0.0.1:18888
+    depends_on:
+      - dotsocr-worker
+      - gemma-worker

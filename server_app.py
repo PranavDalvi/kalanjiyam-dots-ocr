@@ -87,25 +87,29 @@ DOTSOCR_PROMPT = """please output the layout information from the pdf image, inc
     - the output text must be the original text from the image, with no translation.
     - all layout elements must be sorted according to human reading order.
 
-5. final output: the entire output must be a single json object."""
+GEMMA4_OCR_PROMPT = """Extract and transcribe all text from this image with high accuracy, following natural human reading order.
+Do not output template placeholders, repeated phrases, or commentary. Output only the actual text visible in the document.
 
-GEMMA4_OCR_PROMPT = """please output the layout information from the image, including each layout element's bbox, its category, and the corresponding text content within the bbox.
-
-1. bbox format: [x1, y1, x2, y2] normalized to 0-1000 scale.
-
-2. layout categories: the possible categories are ['caption', 'footnote', 'formula', 'list-item', 'page-footer', 'page-header', 'picture', 'section-header', 'table', 'text', 'title'].
-
-3. text extraction & formatting rules:
-    - picture: for the 'picture' category, the text field should be omitted.
-    - formula: format its text as latex.
-    - table: format its text as html.
-    - all others (text, title, etc.): format their text as markdown.
-
-4. constraints:
-    - the output text must be the original text from the image, with no translation.
-    - all layout elements must be sorted according to human reading order.
-
-5. final output: the entire output must be a single json object with a "blocks" array or direct array of layout items."""
+Format the output as a valid JSON object:
+```json
+{
+  "blocks": [
+    {
+      "type": "title",
+      "text": "<transcribed heading>"
+    },
+    {
+      "type": "paragraph",
+      "text": "<transcribed body paragraph>"
+    },
+    {
+      "type": "table",
+      "text": "<transcribed table in markdown format>"
+    }
+  ]
+}
+```
+If the document consists of plain text, transcribe each section or paragraph accurately."""
 
 ENGINE_CONFIGS = {
     "dots-ocr": {
@@ -1817,7 +1821,9 @@ async def run_ocr(
                 }
             ],
             "max_tokens": eff_max_tokens,
-            "temperature": 0.0
+            "temperature": 0.0,
+            "repetition_penalty": 1.15,
+            "presence_penalty": 0.1
         }
 
         try:

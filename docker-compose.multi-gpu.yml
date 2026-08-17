@@ -5,6 +5,8 @@ services:
     container_name: dotsocr_gpu0
     restart: unless-stopped
     network_mode: host
+    ipc: host
+    shm_size: '16gb'
     environment:
       - MODEL_PATH=${HOST_MODEL_PATH:-rednote-hilab/dots.ocr}
       - PINNED_GPU_ID=0
@@ -25,6 +27,8 @@ services:
     container_name: dotsocr_gpu1
     restart: unless-stopped
     network_mode: host
+    ipc: host
+    shm_size: '16gb'
     environment:
       - MODEL_PATH=${HOST_MODEL_PATH:-rednote-hilab/dots.ocr}
       - PINNED_GPU_ID=1
@@ -45,6 +49,8 @@ services:
     container_name: dotsocr_gpu2
     restart: unless-stopped
     network_mode: host
+    ipc: host
+    shm_size: '16gb'
     environment:
       - MODEL_PATH=${HOST_MODEL_PATH:-rednote-hilab/dots.ocr}
       - PINNED_GPU_ID=2
@@ -65,6 +71,8 @@ services:
     container_name: dotsocr_gpu3
     restart: unless-stopped
     network_mode: host
+    ipc: host
+    shm_size: '16gb'
     environment:
       - MODEL_PATH=${HOST_MODEL_PATH:-rednote-hilab/dots.ocr}
       - PINNED_GPU_ID=3

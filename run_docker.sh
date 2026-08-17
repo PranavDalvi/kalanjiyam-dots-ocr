@@ -84,6 +84,8 @@ case "$ACTION" in
       --name dotsocr_standalone \
       --gpus all \
       --network host \
+      --ipc=host \
+      --shm-size=16g \
       -v ~/.cache/huggingface:/root/.cache/huggingface \
       -v ~/.cache/weights:/root/.cache/weights \
       -v "$(pwd)":/workspace \

@@ -8,6 +8,8 @@ services:
     container_name: dotsocr_worker
     restart: unless-stopped
     network_mode: "host"
+    ipc: host
+    shm_size: '16gb'
     environment:
       - MODEL_PATH=${HOST_MODEL_PATH:-rednote-hilab/dots.ocr}
       # If PINNED_GPU_ID is empty, it dynamically picks whichever GPU has the most free VRAM
@@ -41,6 +43,8 @@ services:
     container_name: gemma_worker
     restart: unless-stopped
     network_mode: "host"
+    ipc: host
+    shm_size: '16gb'
     environment:
       - GEMMA4_MODEL_PATH=${GEMMA4_MODEL_PATH:-google/gemma-4-26B-A4B-it}
       # If PINNED_GPU_ID is empty, it dynamically picks whichever GPU has the most free VRAM

@@ -17,7 +17,7 @@ services:
       - FASTAPI_PORT=18887
       - VLLM_PORT=18000
       - IDLE_TIMEOUT_SECONDS=1800
-    volumes: [~/.cache/huggingface:/root/.cache/huggingface, .:/workspace]
+    volumes: [~/.cache/huggingface:/root/.cache/huggingface, ~/.cache/weights:/root/.cache/weights, .:/workspace]
     deploy: { resources: { reservations: { devices: [{driver: nvidia, count: all, capabilities: [gpu]}] } } }
 
   dotsocr-gpu1:
@@ -37,7 +37,7 @@ services:
       - FASTAPI_PORT=18888
       - VLLM_PORT=18001
       - IDLE_TIMEOUT_SECONDS=1800
-    volumes: [~/.cache/huggingface:/root/.cache/huggingface, .:/workspace]
+    volumes: [~/.cache/huggingface:/root/.cache/huggingface, ~/.cache/weights:/root/.cache/weights, .:/workspace]
     deploy: { resources: { reservations: { devices: [{driver: nvidia, count: all, capabilities: [gpu]}] } } }
 
   dotsocr-gpu2:
@@ -57,7 +57,7 @@ services:
       - FASTAPI_PORT=18889
       - VLLM_PORT=18002
       - IDLE_TIMEOUT_SECONDS=1800
-    volumes: [~/.cache/huggingface:/root/.cache/huggingface, .:/workspace]
+    volumes: [~/.cache/huggingface:/root/.cache/huggingface, ~/.cache/weights:/root/.cache/weights, .:/workspace]
     deploy: { resources: { reservations: { devices: [{driver: nvidia, count: all, capabilities: [gpu]}] } } }
 
   dotsocr-gpu3:
@@ -77,7 +77,7 @@ services:
       - FASTAPI_PORT=18890
       - VLLM_PORT=18003
       - IDLE_TIMEOUT_SECONDS=1800
-    volumes: [~/.cache/huggingface:/root/.cache/huggingface, .:/workspace]
+    volumes: [~/.cache/huggingface:/root/.cache/huggingface, ~/.cache/weights:/root/.cache/weights, .:/workspace]
     deploy: { resources: { reservations: { devices: [{driver: nvidia, count: all, capabilities: [gpu]}] } } }
 
   dotsocr-router:

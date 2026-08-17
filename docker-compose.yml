@@ -22,6 +22,7 @@ services:
       - IDLE_TIMEOUT_SECONDS=1800
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
+      - ~/.cache/weights:/root/.cache/weights
       - .:/workspace
     deploy:
       resources:
@@ -60,6 +61,7 @@ services:
       - IDLE_TIMEOUT_SECONDS=1800
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
+      - ~/.cache/weights:/root/.cache/weights
       - .:/workspace
     deploy:
       resources:

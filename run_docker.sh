@@ -85,6 +85,7 @@ case "$ACTION" in
       --gpus all \
       --network host \
       -v ~/.cache/huggingface:/root/.cache/huggingface \
+      -v ~/.cache/weights:/root/.cache/weights \
       -v "$(pwd)":/workspace \
       -e MODEL_PATH="$HOST_MODEL_PATH" \
       -e GEMMA4_MODEL_PATH="$GEMMA_MODEL_HOST_PATH" \

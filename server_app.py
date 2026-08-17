@@ -272,6 +272,7 @@ def _ensure_gemma4_config(model_dir: str):
     on top-level config, text_config, and vision_config for Gemma 4 models
     without corrupting typed dicts like id2label/label2id.
     """
+    _patch_vllm_weight_loader()
     config_path = os.path.join(model_dir, "config.json")
     if not os.path.exists(config_path):
         return
@@ -297,6 +298,36 @@ def _ensure_gemma4_config(model_dir: str):
         log("CONFIG FIX", f"Set allow_global_per_layer_attribute_access=True safely in '{config_path}' for Gemma-4.")
     except Exception as e:
         log("CONFIG WARN", f"Failed to patch Gemma-4 config.json: {e}")
+
+
+def _patch_vllm_weight_loader():
+    """
+    Patches vLLM default_weight_loader to gracefully adapt heterogeneous 1D norm parameters
+    (e.g., sliding-window 256 vs global-attention 512 in Gemma 4) instead of raising AssertionError.
+    """
+    try:
+        import vllm.model_executor.model_loader.weight_utils as wu
+        wu_path = getattr(wu, "__file__", None)
+        if not wu_path or not os.path.exists(wu_path):
+            return
+
+        with open(wu_path, "r") as f:
+            content = f.read()
+
+        target = "assert param.size() == loaded_weight.size(), ("
+        replacement = """if param.size() != loaded_weight.size():
+        if len(param.shape) == 1 and len(loaded_weight.shape) == 1:
+            param.data = loaded_weight.to(device=param.device, dtype=param.dtype)
+            return
+    assert param.size() == loaded_weight.size(), ("""
+
+        if target in content and "len(param.shape) == 1" not in content:
+            content = content.replace(target, replacement, 1)
+            with open(wu_path, "w") as f:
+                f.write(content)
+            log("PATCH", f"Successfully patched vLLM default_weight_loader in '{wu_path}' for heterogeneous Gemma-4 layers.")
+    except Exception as e:
+        log("PATCH WARN", f"Could not patch vLLM weight loader: {e}")
 
 
 def _ensure_config_auto_map(model_dir: str):
@@ -608,6 +639,7 @@ class GPUProcessManager:
                     log("ENGINE SWITCH", f"Switching active engine from '{self.current_engine}' to '{canonical_engine}'. Stopping current workers to release VRAM...")
                 self._stop_backends()
 
+            _patch_vllm_weight_loader()
             effective_model_path = ensure_model_downloaded(canonical_engine)
             model_parent = os.path.dirname(effective_model_path)
             extra_paths = [effective_model_path, model_parent, "/workspace", "/root/.cache/weights"]

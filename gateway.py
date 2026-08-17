@@ -11,7 +11,7 @@ import uvicorn
 # Worker Backend URLs
 DOTSOCR_WORKER_URL = os.getenv("DOTSOCR_WORKER_URL", "http://127.0.0.1:18887").rstrip("/")
 GEMMA_WORKER_URL = os.getenv("GEMMA_WORKER_URL", "http://127.0.0.1:18888").rstrip("/")
-GATEWAY_PORT = int(os.getenv("GATEWAY_PORT", "8887"))
+GATEWAY_PORT = int(os.getenv("GATEWAY_PORT") or "8887")
 
 app = FastAPI(
     title="Kalanjiyam OCR & Metadata Multi-Engine API Gateway",

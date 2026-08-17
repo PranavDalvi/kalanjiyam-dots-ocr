@@ -24,22 +24,43 @@ app = FastAPI(
     version="4.1.0"
 )
 
+def _env_int(key: str, default: int, fallback_key: Optional[str] = None) -> int:
+    val = os.getenv(key, "").strip()
+    if not val and fallback_key:
+        val = os.getenv(fallback_key, "").strip()
+    if not val:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+def _env_float(key: str, default: float) -> float:
+    val = os.getenv(key, "").strip()
+    if not val:
+        return default
+    try:
+        return float(val)
+    except ValueError:
+        return default
+
 # Configuration defaults
-IDLE_TIMEOUT_SECONDS = int(os.getenv("IDLE_TIMEOUT_SECONDS", "1800"))  # 30 minutes
+IDLE_TIMEOUT_SECONDS = _env_int("IDLE_TIMEOUT_SECONDS", 1800)  # 30 minutes
 # API admission and engine batching must be controlled independently.  Increasing
 # vLLM's sequence count can lower OCR decode throughput on a single A6000, while
 # allowing several HTTP requests to wait for the engine remains useful.
-API_MAX_CONCURRENT_REQUESTS = int(
-    os.getenv("API_MAX_CONCURRENT_REQUESTS", os.getenv("MAX_CONCURRENT_REQUESTS", "8"))
+API_MAX_CONCURRENT_REQUESTS = _env_int(
+    "API_MAX_CONCURRENT_REQUESTS", 8, fallback_key="MAX_CONCURRENT_REQUESTS"
 )
-VLLM_MAX_NUM_SEQS = int(os.getenv("VLLM_MAX_NUM_SEQS", "1"))
+VLLM_MAX_NUM_SEQS = _env_int("VLLM_MAX_NUM_SEQS", 1)
 VLLM_MAX_NUM_BATCHED_TOKENS = os.getenv("VLLM_MAX_NUM_BATCHED_TOKENS")
-GPU_MEMORY_UTILIZATION = float(os.getenv("GPU_MEMORY_UTILIZATION", "0.90"))
-GPU_COUNT = int(os.getenv("GPU_COUNT", "1"))
-PINNED_GPU_ID = os.getenv("PINNED_GPU_ID")
-MIN_FREE_VRAM_MB = int(os.getenv("MIN_FREE_VRAM_MB", "36000"))
-GPU_MEMORY_HEADROOM_MB = int(os.getenv("GPU_MEMORY_HEADROOM_MB", "1024"))
-VLLM_PORT = int(os.getenv("VLLM_PORT", "8000"))
+GPU_MEMORY_UTILIZATION = _env_float("GPU_MEMORY_UTILIZATION", 0.90)
+GPU_COUNT = _env_int("GPU_COUNT", 1)
+_pinned_raw = os.getenv("PINNED_GPU_ID", "").strip()
+PINNED_GPU_ID = int(_pinned_raw) if _pinned_raw.isdigit() else None
+MIN_FREE_VRAM_MB = _env_int("MIN_FREE_VRAM_MB", 36000)
+GPU_MEMORY_HEADROOM_MB = _env_int("GPU_MEMORY_HEADROOM_MB", 1024)
+VLLM_PORT = _env_int("VLLM_PORT", 8000)
 VLLM_BASE_URL = f"http://localhost:{VLLM_PORT}/v1/chat/completions"
 MODEL_PATH = os.getenv("MODEL_PATH", "")
 MODEL_NAME = "model"
@@ -125,7 +146,7 @@ ENGINE_CONFIGS = {
         "model_version": "1.0.0",
         "requires_native_registration": False,
         "prompt": GEMMA4_OCR_PROMPT,
-        "min_free_vram_mb": int(os.getenv("GEMMA4_MIN_FREE_VRAM_MB", "30000")),
+        "min_free_vram_mb": _env_int("GEMMA4_MIN_FREE_VRAM_MB", 30000),
     },
     "kalanjiyam-archival": {
         "engine_id": "kalanjiyam-archival",
@@ -138,7 +159,7 @@ ENGINE_CONFIGS = {
         "model_version": "1.0.0",
         "requires_native_registration": False,
         "prompt": "",
-        "min_free_vram_mb": int(os.getenv("METADATA_MIN_FREE_VRAM_MB", os.getenv("GEMMA4_MIN_FREE_VRAM_MB", "30000"))),
+        "min_free_vram_mb": _env_int("METADATA_MIN_FREE_VRAM_MB", _env_int("GEMMA4_MIN_FREE_VRAM_MB", 30000)),
     },
 }
 
@@ -413,7 +434,7 @@ def select_best_gpu(min_free_vram_mb: int = MIN_FREE_VRAM_MB, excluded_gpu_ids: 
 
     excluded_gpu_ids = excluded_gpu_ids or set()
     if PINNED_GPU_ID is not None:
-        pinned_gpu_id = int(PINNED_GPU_ID)
+        pinned_gpu_id = PINNED_GPU_ID
         if pinned_gpu_id in excluded_gpu_ids:
             raise RuntimeError(f"Pinned GPU {pinned_gpu_id} was selected more than once.")
         sorted_gpus = [gpu for gpu in gpus if gpu["index"] == pinned_gpu_id]

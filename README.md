@@ -86,6 +86,43 @@ The service dynamically detects available GPU memory and hardware capabilities:
 
 ---
 
+### GPU-Specific Launch Presets
+
+#### 1. NVIDIA RTX A6000 / RTX 6000 Ada / A100 (48GB VRAM)
+```bash
+# Option A (Recommended): Google Gemma-4 E4B (Full Precision BF16 in ~8GB VRAM, blazing fast)
+GEMMA4_MODEL_PATH=google/gemma-4-E4B-it bash run_docker.sh start
+
+# Option B: Google Gemma-4 26B with BitsAndBytes Quantization (~18-22GB VRAM on 1 GPU)
+VLLM_QUANTIZATION=bitsandbytes bash run_docker.sh start
+
+# Option C: Google Gemma-4 26B with FP8 Quantization (~18GB VRAM on 1 GPU)
+VLLM_QUANTIZATION=fp8 bash run_docker.sh start
+```
+
+#### 2. NVIDIA H100 (80GB VRAM) & A100 (80GB VRAM)
+```bash
+# Full Precision Gemma-4 26B with CUDA Graph Acceleration and 16k context window
+TENSOR_PARALLEL_SIZE=1 VLLM_ENFORCE_EAGER=0 VLLM_MAX_MODEL_LEN=16384 bash run_docker.sh start
+
+# Pinned dedicated H100 GPUs (DotsOCR on GPU 0, Gemma on GPU 1)
+DOTSOCR_GPU_ID=0 GEMMA_GPU_ID=1 TENSOR_PARALLEL_SIZE=1 bash run_docker.sh start
+```
+
+#### 3. NVIDIA RTX 4090 / RTX 3090 / A100 (24GB – 40GB VRAM)
+```bash
+# Gemma-4 E4B (High accuracy multimodal in ~8GB VRAM)
+GEMMA4_MODEL_PATH=google/gemma-4-E4B-it bash run_docker.sh start
+
+# Gemma-4 E2B (Ultra lightweight in ~4GB VRAM)
+GEMMA4_MODEL_PATH=google/gemma-4-E2B-it bash run_docker.sh start
+
+# Gemma-4 26B with 4-bit BitsAndBytes quantization
+VLLM_QUANTIZATION=bitsandbytes GEMMA4_MAX_MODEL_LEN=4096 bash run_docker.sh start
+```
+
+---
+
 ## 🐳 Docker Deployment (`run_docker.sh`)
 
 The easiest way to start and manage the services is using [`run_docker.sh`](file:///home/mrportable/Documents/kalanjiyam-dots-ocr/run_docker.sh):
@@ -107,16 +144,19 @@ bash run_docker.sh stop
 bash run_docker.sh rebuild
 ```
 
-### Customizing Deployments via `.env` or Environment Variables
+### Customizing Deployments via Environment Variables
 
-You can override defaults directly when running docker compose:
+You can prepend environment variables directly to `bash run_docker.sh start`:
 
 ```bash
-# Example: Running on an H100 with TP=1 and 16k context
-TENSOR_PARALLEL_SIZE=1 VLLM_MAX_MODEL_LEN=16384 docker compose up -d
+# Example 1: Fast Gemma-4 E4B Model on any GPU
+GEMMA4_MODEL_PATH=google/gemma-4-E4B-it bash run_docker.sh start
 
-# Example: Running on a single A6000 with FP8 quantization
-VLLM_QUANTIZATION=fp8 docker compose up -d
+# Example 2: Unquantized 26B Model on H100 80GB
+TENSOR_PARALLEL_SIZE=1 VLLM_MAX_MODEL_LEN=16384 bash run_docker.sh start
+
+# Example 3: Quantized 26B Model on Single A6000 48GB
+VLLM_QUANTIZATION=bitsandbytes bash run_docker.sh start
 ```
 
 ---

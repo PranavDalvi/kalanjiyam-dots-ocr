@@ -212,7 +212,6 @@ def ensure_model_downloaded(engine_id: str = "dots-ocr") -> str:
     canonical_engine = resolve_engine(engine_id)
     config = ENGINE_CONFIGS.get(canonical_engine, ENGINE_CONFIGS["dots-ocr"])
 
-    target_dir = config["local_cache_dir"]
     if canonical_engine == "dots-ocr":
         model_to_use = os.getenv("DOTSOCR_MODEL_PATH", MODEL_PATH if MODEL_PATH and "gemma" not in MODEL_PATH.lower() else config["default_model_path"])
     elif canonical_engine == "gemma-4":
@@ -221,6 +220,13 @@ def ensure_model_downloaded(engine_id: str = "dots-ocr") -> str:
         model_to_use = os.getenv("METADATA_MODEL_PATH", os.getenv("GEMMA4_MODEL_PATH", config["default_model_path"]))
     else:
         model_to_use = config["default_model_path"]
+
+    # Derive target_dir dynamically from model_to_use
+    model_slug = model_to_use.strip("/").split("/")[-1]
+    if "dots" in model_to_use.lower():
+        target_dir = "/root/.cache/weights/DotsOCR"
+    else:
+        target_dir = os.path.join("/root/.cache/weights", model_slug)
 
     # If already a local directory with model files
     if os.path.exists(model_to_use) and os.path.isdir(model_to_use) and os.path.exists(os.path.join(model_to_use, "config.json")):

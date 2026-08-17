@@ -1,26 +1,23 @@
 # Use pre-configured DotsOCR base image containing vLLM, PyTorch & CUDA
 FROM rednotehilab/dots.ocr:vllm-openai-v0.9.1
 
-# Install uv from official Astral image
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-
 # Set working directory
 WORKDIR /workspace
 
-# Install apt-utils, git, and latest transformers for Gemma 4 (gemma4) architecture support
+# Install apt-utils, git for fetching latest transformers
 RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends apt-utils git && \
     rm -rf /var/lib/apt/lists/*
 
-# Install API service dependencies using uv
-RUN uv pip install --system \
+# Install API service dependencies & upgrade transformers to support gemma4
+RUN pip install --no-cache-dir \
     fastapi \
     uvicorn \
     pymupdf \
     pillow \
     requests \
-    git+https://github.com/huggingface/transformers.git \
-    accelerate
+    accelerate && \
+    pip install --no-cache-dir --upgrade --force-reinstall git+https://github.com/huggingface/transformers.git
 
 # Copy project source code into container
 COPY server_app.py /workspace/server_app.py

@@ -30,7 +30,7 @@ export GEMMA4_MODEL_PATH="$GEMMA_MODEL_HOST_PATH"
 
 case "$ACTION" in
   build|rebuild)
-    echo "[Docker Manager] Building all container images with --no-cache using uv..."
+    echo "[Docker Manager] Building all container images with --no-cache..."
     $COMPOSE_CMD build --no-cache
     echo "[Docker Manager] Build complete."
     ;;
@@ -130,7 +130,7 @@ case "$ACTION" in
     echo "  start         # Build & start Gateway + DotsOCR Worker + Gemma Worker (docker-compose)"
     echo "  stop          # Stop all compose containers"
     echo "  restart       # Restart all compose containers"
-    echo "  rebuild       # Rebuild all images with --no-cache and uv"
+    echo "  rebuild       # Rebuild all images with --no-cache"
     echo "  logs          # Tail logs for all compose containers"
     echo "  status        # Check status and engine discovery"
     echo "  start-single  # Run standalone single-container service on port 8887"

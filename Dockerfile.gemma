@@ -1,23 +1,20 @@
 # Base image: Official vLLM image with modern PyTorch and CUDA
 FROM vllm/vllm-openai:latest
 
-# Install uv from official Astral image
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-
 WORKDIR /workspace
 
-# Install apt-utils, git, and latest transformers from source for Gemma 4 (gemma4) architecture support
+# Install apt-utils, git for fetching latest transformers
 RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends apt-utils git && \
     rm -rf /var/lib/apt/lists/*
 
-RUN uv pip install --system \
+RUN pip install --no-cache-dir \
     pymupdf \
     pillow \
     requests \
     "fastapi<0.137.0" \
-    git+https://github.com/huggingface/transformers.git \
-    accelerate
+    accelerate && \
+    pip install --no-cache-dir --upgrade --force-reinstall git+https://github.com/huggingface/transformers.git
 
 # Copy application source code
 COPY server_app.py /workspace/server_app.py

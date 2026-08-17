@@ -263,8 +263,8 @@ def ensure_model_downloaded(engine_id: str = "dots-ocr") -> str:
 def _ensure_gemma4_config(model_dir: str):
     """
     Ensures config.json has allow_global_per_layer_attribute_access = True
-    to allow vLLM to read global head_dim on heterogeneous Gemma 4 models
-    under transformers>=5.15.0.
+    on top-level config, text_config, and vision_config for Gemma 4 models
+    without corrupting typed dicts like id2label/label2id.
     """
     config_path = os.path.join(model_dir, "config.json")
     if not os.path.exists(config_path):
@@ -272,11 +272,23 @@ def _ensure_gemma4_config(model_dir: str):
     try:
         with open(config_path, "r") as f:
             cfg = json.load(f)
-        if not cfg.get("allow_global_per_layer_attribute_access"):
-            cfg["allow_global_per_layer_attribute_access"] = True
-            with open(config_path, "w") as f:
-                json.dump(cfg, f, indent=2)
-            log("CONFIG FIX", f"Set allow_global_per_layer_attribute_access=True in '{config_path}' for Gemma-4.")
+
+        def _clean_dict(d: dict):
+            for map_key in ("id2label", "label2id"):
+                if map_key in d and isinstance(d[map_key], dict):
+                    d[map_key].pop("allow_global_per_layer_attribute_access", None)
+
+        cfg["allow_global_per_layer_attribute_access"] = True
+        _clean_dict(cfg)
+
+        for sub_key in ("text_config", "vision_config", "language_config"):
+            if sub_key in cfg and isinstance(cfg[sub_key], dict):
+                cfg[sub_key]["allow_global_per_layer_attribute_access"] = True
+                _clean_dict(cfg[sub_key])
+
+        with open(config_path, "w") as f:
+            json.dump(cfg, f, indent=2)
+        log("CONFIG FIX", f"Set allow_global_per_layer_attribute_access=True safely in '{config_path}' for Gemma-4.")
     except Exception as e:
         log("CONFIG WARN", f"Failed to patch Gemma-4 config.json: {e}")
 
@@ -605,6 +617,7 @@ class GPUProcessManager:
                 env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
                 env["VLLM_USE_V1"] = "0"
                 env["PYTHONPATH"] = pythonpath_str
+                env["PYTORCH_CUDA_ALLOC_CONF"] = os.getenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
                 cmd = [
                     "vllm", "serve", effective_model_path,
                     "--tensor-parallel-size", "1",
@@ -618,13 +631,21 @@ class GPUProcessManager:
                 if max_model_len:
                     cmd.extend(["--max-model-len", str(max_model_len)])
                 elif canonical_engine == "gemma-4":
-                    cmd.extend(["--max-model-len", "8192"])
+                    cmd.extend(["--max-model-len", "4096"])
 
                 vllm_dtype = os.getenv("VLLM_DTYPE", "auto")
                 if vllm_dtype and vllm_dtype != "auto":
                     cmd.extend(["--dtype", vllm_dtype])
 
-                if os.getenv("VLLM_ENFORCE_EAGER", "0").lower() in ("1", "true", "yes"):
+                vllm_quant = os.getenv("VLLM_QUANTIZATION", os.getenv("QUANTIZATION", ""))
+                if vllm_quant:
+                    cmd.extend(["--quantization", vllm_quant])
+
+                vllm_kv_cache_dtype = os.getenv("VLLM_KV_CACHE_DTYPE", "")
+                if vllm_kv_cache_dtype:
+                    cmd.extend(["--kv-cache-dtype", vllm_kv_cache_dtype])
+
+                if os.getenv("VLLM_ENFORCE_EAGER", "1" if canonical_engine == "gemma-4" else "0").lower() in ("1", "true", "yes"):
                     cmd.append("--enforce-eager")
 
                 if VLLM_MAX_NUM_BATCHED_TOKENS:

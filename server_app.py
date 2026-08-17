@@ -324,7 +324,8 @@ def _patch_vllm_weight_loader():
     try:
         if param.size() != loaded_weight.size():
             if len(param.shape) == 1 and len(loaded_weight.shape) == 1:
-                param.data = loaded_weight.to(device=param.device, dtype=param.dtype)
+                min_len = min(param.size(0), loaded_weight.size(0))
+                param.data[:min_len].copy_(loaded_weight[:min_len])
                 return
         param.data.copy_(loaded_weight)
     except Exception as e:

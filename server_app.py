@@ -227,6 +227,8 @@ def ensure_model_downloaded(engine_id: str = "dots-ocr") -> str:
         if config["requires_native_registration"]:
             _ensure_config_auto_map(model_to_use)
             _install_vllm_native_registration(model_to_use)
+        if "gemma" in canonical_engine or "archival" in canonical_engine:
+            _ensure_gemma4_config(model_to_use)
         return model_to_use
 
     # If already downloaded in target cache folder
@@ -234,6 +236,8 @@ def ensure_model_downloaded(engine_id: str = "dots-ocr") -> str:
         if config["requires_native_registration"]:
             _ensure_config_auto_map(target_dir)
             _install_vllm_native_registration(target_dir)
+        if "gemma" in canonical_engine or "archival" in canonical_engine:
+            _ensure_gemma4_config(target_dir)
         return target_dir
 
     log("MODEL DOWNLOAD", f"Pre-downloading model '{model_to_use}' for engine '{canonical_engine}' to local folder '{target_dir}'...")
@@ -248,10 +252,33 @@ def ensure_model_downloaded(engine_id: str = "dots-ocr") -> str:
         if config["requires_native_registration"]:
             _ensure_config_auto_map(target_dir)
             _install_vllm_native_registration(target_dir)
+        if "gemma" in canonical_engine or "archival" in canonical_engine:
+            _ensure_gemma4_config(target_dir)
         return target_dir
     except Exception as e:
         log("MODEL WARN", f"Snapshot download failed ({e}). Using raw path '{model_to_use}'.")
         return model_to_use
+
+
+def _ensure_gemma4_config(model_dir: str):
+    """
+    Ensures config.json has allow_global_per_layer_attribute_access = True
+    to allow vLLM to read global head_dim on heterogeneous Gemma 4 models
+    under transformers>=5.15.0.
+    """
+    config_path = os.path.join(model_dir, "config.json")
+    if not os.path.exists(config_path):
+        return
+    try:
+        with open(config_path, "r") as f:
+            cfg = json.load(f)
+        if not cfg.get("allow_global_per_layer_attribute_access"):
+            cfg["allow_global_per_layer_attribute_access"] = True
+            with open(config_path, "w") as f:
+                json.dump(cfg, f, indent=2)
+            log("CONFIG FIX", f"Set allow_global_per_layer_attribute_access=True in '{config_path}' for Gemma-4.")
+    except Exception as e:
+        log("CONFIG WARN", f"Failed to patch Gemma-4 config.json: {e}")
 
 
 def _ensure_config_auto_map(model_dir: str):

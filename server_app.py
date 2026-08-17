@@ -314,20 +314,52 @@ def _patch_vllm_weight_loader():
         with open(wu_path, "r") as f:
             content = f.read()
 
-        target = "assert param.size() == loaded_weight.size(), ("
-        replacement = """if param.size() != loaded_weight.size():
-        if len(param.shape) == 1 and len(loaded_weight.shape) == 1:
-            param.data = loaded_weight.to(device=param.device, dtype=param.dtype)
-            return
-    assert param.size() == loaded_weight.size(), ("""
+        correct_patch = (
+            "    if param.size() != loaded_weight.size():\n"
+            "        if len(param.shape) == 1 and len(loaded_weight.shape) == 1:\n"
+            "            param.data = loaded_weight.to(device=param.device, dtype=param.dtype)\n"
+            "            return\n"
+            "    assert param.size() == loaded_weight.size(), ("
+        )
 
-        if target in content and "len(param.shape) == 1" not in content:
-            content = content.replace(target, replacement, 1)
+        import re
+        broken_pattern = r"[ \t]*if param\.size\(\) != loaded_weight\.size\(\):[\s\S]*?assert param\.size\(\) == loaded_weight\.size\(\), \("
+        if re.search(broken_pattern, content):
+            content = re.sub(broken_pattern, correct_patch.strip("\n"), content, count=1)
+            with open(wu_path, "w") as f:
+                f.write(content)
+            log("PATCH", f"Repaired and verified vLLM default_weight_loader in '{wu_path}'.")
+            return
+
+        pattern = r"([ \t]*)assert param\.size\(\) == loaded_weight\.size\(\), \("
+        if re.search(pattern, content):
+            content = re.sub(pattern, correct_patch.strip("\n"), content, count=1)
             with open(wu_path, "w") as f:
                 f.write(content)
             log("PATCH", f"Successfully patched vLLM default_weight_loader in '{wu_path}' for heterogeneous Gemma-4 layers.")
     except Exception as e:
         log("PATCH WARN", f"Could not patch vLLM weight loader: {e}")
+
+
+def _patch_transformers_register():
+    """
+    Patches transformers AutoConfig.register to ignore duplicate model registrations,
+    preventing: ValueError: 'aimv2' is already used by a Transformers config.
+    """
+    try:
+        from transformers.models.auto import configuration_auto
+        cfg_auto_path = getattr(configuration_auto, "__file__", None)
+        if cfg_auto_path and os.path.exists(cfg_auto_path):
+            with open(cfg_auto_path, "r") as f:
+                content = f.read()
+            target_str = 'raise ValueError(f"\'{key}\' is already used by a Transformers config, pick another name.")'
+            if target_str in content:
+                content = content.replace(target_str, 'pass  # allow duplicate registrations in vLLM')
+                with open(cfg_auto_path, "w") as f:
+                    f.write(content)
+                log("PATCH", f"Patched transformers configuration_auto in '{cfg_auto_path}' to allow duplicate model registration.")
+    except Exception as e:
+        log("PATCH WARN", f"Could not patch transformers config registration: {e}")
 
 
 def _ensure_config_auto_map(model_dir: str):
@@ -639,6 +671,7 @@ class GPUProcessManager:
                     log("ENGINE SWITCH", f"Switching active engine from '{self.current_engine}' to '{canonical_engine}'. Stopping current workers to release VRAM...")
                 self._stop_backends()
 
+            _patch_transformers_register()
             _patch_vllm_weight_loader()
             effective_model_path = ensure_model_downloaded(canonical_engine)
             model_parent = os.path.dirname(effective_model_path)
@@ -665,9 +698,10 @@ class GPUProcessManager:
                 port = VLLM_PORT + worker_index
                 env = os.environ.copy()
                 env["CUDA_VISIBLE_DEVICES"] = gpu_str
-                env["VLLM_USE_V1"] = "0"
                 env["PYTHONPATH"] = pythonpath_str
                 env["PYTORCH_CUDA_ALLOC_CONF"] = os.getenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+                for custom_var in ["VLLM_MAX_NUM_SEQS", "VLLM_ENFORCE_EAGER", "VLLM_QUANTIZATION", "VLLM_MAX_MODEL_LEN", "VLLM_KV_CACHE_DTYPE", "VLLM_USE_V1"]:
+                    env.pop(custom_var, None)
                 cmd = [
                     "vllm", "serve", effective_model_path,
                     "--tensor-parallel-size", str(tp_size),

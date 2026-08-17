@@ -9,15 +9,14 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends apt-utils git && \
     rm -rf /var/lib/apt/lists/*
 
-# Install API service dependencies & upgrade transformers to support gemma4
+# Install API service dependencies
 RUN pip install --no-cache-dir \
     fastapi \
     uvicorn \
     pymupdf \
     pillow \
     requests \
-    accelerate && \
-    pip install --no-cache-dir --upgrade --force-reinstall git+https://github.com/huggingface/transformers.git
+    accelerate
 
 # Copy project source code into container
 COPY server_app.py /workspace/server_app.py

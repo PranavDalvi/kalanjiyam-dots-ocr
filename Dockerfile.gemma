@@ -13,8 +13,9 @@ RUN pip install --no-cache-dir \
     pillow \
     requests \
     "fastapi<0.137.0" \
-    accelerate && \
-    pip install --no-cache-dir --upgrade --force-reinstall git+https://github.com/huggingface/transformers.git
+    accelerate \
+    bitsandbytes && \
+    pip install --no-cache-dir --upgrade vllm transformers git+https://github.com/huggingface/transformers.git
 
 # Copy application source code
 COPY server_app.py /workspace/server_app.py

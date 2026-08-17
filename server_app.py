@@ -609,18 +609,37 @@ class GPUProcessManager:
             selected_gpu_ids = set()
             min_vram = config.get("min_free_vram_mb", MIN_FREE_VRAM_MB)
 
+            tp_size = _env_int("TENSOR_PARALLEL_SIZE", _env_int(f"{canonical_engine.upper().replace('-', '_')}_TP_SIZE", 1))
+            if canonical_engine == "gemma-4" and tp_size == 1 and not os.getenv("TENSOR_PARALLEL_SIZE") and not os.getenv("GEMMA4_TP_SIZE"):
+                available_gpus = get_gpu_info()
+                max_free_single_gpu = max([g["free_mb"] for g in available_gpus], default=0)
+                # On cards with < 60GB VRAM (e.g. 48GB A6000), unquantized 26B needs TP=2.
+                # On 80GB cards (e.g. H100 SXM/NVL with >60GB free), it runs comfortably on TP=1.
+                if max_free_single_gpu < 60000 and len(available_gpus) >= 2 and not os.getenv("VLLM_QUANTIZATION"):
+                    tp_size = 2
+
             for worker_index in range(GPU_COUNT):
-                gpu_idx, safe_utilization = select_best_gpu(min_free_vram_mb=min_vram, excluded_gpu_ids=selected_gpu_ids)
-                selected_gpu_ids.add(gpu_idx)
+                worker_gpu_ids = []
+                safe_utilization = GPU_MEMORY_UTILIZATION
+                for _ in range(tp_size):
+                    gpu_idx, safe_utilization = select_best_gpu(
+                        min_free_vram_mb=min_vram // tp_size if tp_size > 1 else min_vram,
+                        excluded_gpu_ids=selected_gpu_ids
+                    )
+                    selected_gpu_ids.add(gpu_idx)
+                    worker_gpu_ids.append(gpu_idx)
+
+                gpu_str = ",".join(str(g) for g in worker_gpu_ids)
+                primary_gpu = worker_gpu_ids[0]
                 port = VLLM_PORT + worker_index
                 env = os.environ.copy()
-                env["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
+                env["CUDA_VISIBLE_DEVICES"] = gpu_str
                 env["VLLM_USE_V1"] = "0"
                 env["PYTHONPATH"] = pythonpath_str
                 env["PYTORCH_CUDA_ALLOC_CONF"] = os.getenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
                 cmd = [
                     "vllm", "serve", effective_model_path,
-                    "--tensor-parallel-size", "1",
+                    "--tensor-parallel-size", str(tp_size),
                     "--gpu-memory-utilization", str(safe_utilization),
                     "--max-num-seqs", str(VLLM_MAX_NUM_SEQS),
                     "--trust-remote-code",
@@ -645,15 +664,15 @@ class GPUProcessManager:
                 if vllm_kv_cache_dtype:
                     cmd.extend(["--kv-cache-dtype", vllm_kv_cache_dtype])
 
-                if os.getenv("VLLM_ENFORCE_EAGER", "1" if canonical_engine == "gemma-4" else "0").lower() in ("1", "true", "yes"):
+                if os.getenv("VLLM_ENFORCE_EAGER", "1" if canonical_engine == "gemma-4" and tp_size == 1 else "0").lower() in ("1", "true", "yes"):
                     cmd.append("--enforce-eager")
 
                 if VLLM_MAX_NUM_BATCHED_TOKENS:
                     cmd.extend(["--max-num-batched-tokens", VLLM_MAX_NUM_BATCHED_TOKENS])
-                log("BACKEND LAUNCH", f"Launching {canonical_engine} worker {worker_index + 1}/{GPU_COUNT} on GPU {gpu_idx}, port {port}, memory target {safe_utilization}.")
+                log("BACKEND LAUNCH", f"Launching {canonical_engine} worker {worker_index + 1}/{GPU_COUNT} on GPU(s) [{gpu_str}] (TP={tp_size}), port {port}, memory target {safe_utilization}.")
                 proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, preexec_fn=os.setsid if os.name != "nt" else None)
-                backend = {"gpu_idx": gpu_idx, "port": port, "process": proc, "engine": canonical_engine}
-                threading.Thread(target=self._stream_logs, args=(proc, gpu_idx, canonical_engine), daemon=True).start()
+                backend = {"gpu_idx": primary_gpu, "gpu_ids": worker_gpu_ids, "port": port, "process": proc, "engine": canonical_engine}
+                threading.Thread(target=self._stream_logs, args=(proc, primary_gpu, canonical_engine), daemon=True).start()
 
                 start_wait = time.time()
                 while time.time() - start_wait < 300:
@@ -1902,6 +1921,13 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=int(os.getenv("FASTAPI_PORT", "8887")), help="Port to run FastAPI service on")
     parser.add_argument("--engine", default=DEFAULT_ENGINE, help="Default OCR engine ('dots-ocr' or 'gemma-4')")
     parser.add_argument("--model-path", default=None, help="Custom model path override")
+    parser.add_argument("--tp-size", "--tensor-parallel-size", type=int, default=None, help="Tensor parallel size (e.g. 1 on H100, 2 on 2x A6000)")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=None, help="vLLM GPU memory utilization target (0.1 - 1.0)")
+    parser.add_argument("--max-model-len", type=int, default=None, help="Maximum context sequence length")
+    parser.add_argument("--quantization", default=None, help="Quantization method ('fp8', 'bitsandbytes', 'awq')")
+    parser.add_argument("--kv-cache-dtype", default=None, help="KV cache data type (e.g. 'fp8', 'auto')")
+    parser.add_argument("--pinned-gpu", default=None, help="Pinned GPU ID (e.g. 0 or 1)")
+    parser.add_argument("--enforce-eager", action="store_true", default=False, help="Disable CUDA graphs and enforce eager mode")
     args = parser.parse_args()
 
     if args.engine:
@@ -1910,6 +1936,20 @@ if __name__ == "__main__":
     if args.model_path:
         MODEL_PATH = args.model_path
         os.environ["MODEL_PATH"] = args.model_path
+    if args.tp_size is not None:
+        os.environ["TENSOR_PARALLEL_SIZE"] = str(args.tp_size)
+    if args.gpu_memory_utilization is not None:
+        os.environ["GPU_MEMORY_UTILIZATION"] = str(args.gpu_memory_utilization)
+    if args.max_model_len is not None:
+        os.environ["VLLM_MAX_MODEL_LEN"] = str(args.max_model_len)
+    if args.quantization:
+        os.environ["VLLM_QUANTIZATION"] = str(args.quantization)
+    if args.kv_cache_dtype:
+        os.environ["VLLM_KV_CACHE_DTYPE"] = str(args.kv_cache_dtype)
+    if args.pinned_gpu:
+        os.environ["PINNED_GPU_ID"] = str(args.pinned_gpu)
+    if args.enforce_eager:
+        os.environ["VLLM_ENFORCE_EAGER"] = "1"
 
     log("SERVER START", f"Starting OCR API server on {args.host}:{args.port} (default engine: {DEFAULT_ENGINE})...")
     uvicorn.run("server_app:app", host=args.host, port=args.port, reload=False)

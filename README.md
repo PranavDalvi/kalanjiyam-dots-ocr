@@ -1,219 +1,181 @@
 # Kalanjiyam DotsOCR & Archival Metadata Extraction Service
 
-A high-performance FastAPI service providing layout-aware OCR (DotsOCR / Gemma-4) and Archival Metadata Extraction with dynamic GPU allocation and concurrency gating.
+A high-performance, multi-engine FastAPI service and distributed inference pipeline providing layout-aware OCR (DotsOCR / Gemma-4) and Archival Metadata Extraction with dynamic GPU allocation, concurrency gating, and automated Tensor Parallelism.
 
 ---
 
-## Key Features
+## 🏛️ System Architecture
 
-- **Layout-Aware OCR (`POST /v1/ocr`)**: Processes document images into typed layout blocks (headings, paragraphs, tables, equations) with pixel bounding boxes conforming to Kalanjiyam OCR Service Contract (v2.1).
-- **Archival Metadata Extraction (`POST /v1/metadata`)**: Stateless per-window metadata extraction returning structured archival description fields (titles, dates, entities, scope content) alongside per-window metrics (`chars_in`, `engine_latency_ms`, `usage`, `fields_attempted`, `fields_returned`, `fields_declined`) using `gemma-4`, conforming to **Metadata Extraction API Specification (v1.0)**.
-- **Async Batch Inference Pipeline (`async_infer-lazy-buffer_newer_w_s3.py`)**: High-throughput pipeline streaming images and PDFs from local disk or S3 through LLM backends (vLLM, SGLang, LMDeploy, TRT-LLM).
-- Converts PDFs to images lazily per-page using PyMuPDF
-- Concurrent inference with configurable concurrency and request rate
-- Disk spill buffer when RAM queue is full
-- Resume support — skips already-processed IDs on restart
-- Supports SGLang, vLLM, LMDeploy, and TRT-LLM backends
-- Path-style S3 addressing for VPC Gateway Endpoint compatibility
+```mermaid
+graph TD
+    Client["Client / Application"] -->|HTTP Port 8887| GW["Unified API Gateway (gateway.py)"]
+    GW -->|engine: 'dots-ocr'| DW["DotsOCR Worker (Port 18887, GPU 0)"]
+    GW -->|engine: 'gemma-4' or /v1/metadata| GWK["Gemma-4 Worker (Port 18888, GPU 1 / Multi-GPU)"]
+    DW --> VLLM1["vLLM Engine (rednote-hilab/dots.ocr)"]
+    GWK --> VLLM2["vLLM Engine (google/gemma-4-26B-A4B-it)"]
+```
+
+- **Unified Gateway (Port 8887)**: Single public entrypoint that inspects incoming requests and routes them to dedicated GPU worker containers.
+- **DotsOCR Worker (Port 18887)**: Dedicated worker optimized for high-speed page layout parsing and bbox extraction.
+- **Gemma-4 Worker (Port 18888)**: Dedicated worker handling multimodal OCR and Archival Metadata Extraction with smart GPU memory management.
+- **Async Batch Pipeline**: High-throughput distributed batch streaming from S3/local storage through vLLM/SGLang backends.
 
 ---
 
-## Installation
+## 🚀 API Endpoints
+
+### 1. Layout-Aware OCR (`POST /v1/ocr`)
+Extracts text and typed layout blocks (headings, paragraphs, tables, equations, footers) with normalized pixel bounding boxes.
 
 ```bash
-pip install aiohttp aiofiles numpy requests filetype tqdm transformers \
-            jinja2 pandas boto3 fsspec s3fs smart_open pillow pymupdf \
-            python-magic pyyaml
+# DotsOCR (Default)
+curl -X POST http://localhost:8887/v1/ocr \
+  -F "file=@sample.jpg"
+
+# Gemma-4 OCR
+curl -X POST http://localhost:8887/v1/ocr \
+  -F "file=@sample.jpg" \
+  -F "engine=gemma-4"
 ```
 
----
-
-## Usage
+### 2. Archival Metadata Extraction (`POST /v1/metadata`)
+Stateless per-window metadata extraction returning structured archival description fields (titles, dates, entities, scope content) alongside per-window metrics (`chars_in`, `engine_latency_ms`, `usage`, `fields_attempted`, `fields_returned`, `fields_declined`).
 
 ```bash
-python async_infer.py \
-  --input-path /path/to/images_or_pdfs \
-  --output-file results.jsonl \
-  --instruction-path instruction_prompts.yaml \
-  --task dotsocr_w_layout \
-  --temp-path /tmp \
-  --backend vllm-chat \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --max-concurrency 100
+curl -X POST http://localhost:8887/v1/metadata \
+  -H "Content-Type: application/json" \
+  -d '{
+    "unit_id": "unit_001",
+    "pages": [
+      {
+        "page_idx": 0,
+        "blocks": [
+          {"block_idx": 0, "type": "title", "text": "GOVERNMENT OF TAMIL NADU ARCHIVES"},
+          {"block_idx": 1, "type": "paragraph", "text": "Public Department Order No. 452 dated 14th August 1942 regarding administrative reforms..."}
+        ]
+      }
+    ]
+  }'
 ```
+
+### 3. Discovery & Health
+- **Engine Discovery (`GET /v1/engines`)**: Returns active worker statuses and assigned GPU indices.
+- **Health Check (`GET /health`)**: Deep health probe for worker responsiveness and GPU status.
+- **GPU Telemetry (`GET /gpu-status`)**: Real-time VRAM allocation and free memory per GPU.
 
 ---
 
-## Arguments
+## ⚡ Hardware & GPU Configuration Flags
 
-### Input / Output
+The service dynamically detects available GPU memory and hardware capabilities:
+- **NVIDIA H100 / A100 (80GB VRAM)**: Unquantized Gemma-4-26B runs comfortably on a **single GPU (`TP=1`)** with full CUDA Graph optimizations.
+- **NVIDIA RTX A6000 / A100 (40GB/48GB VRAM)**: Automatically switches to **Tensor Parallelism (`TP=2`)** across 2 GPUs so the 26B model loads with >24GB of free KV-cache headroom.
 
-| Argument | Required | Default | Description |
-|---|---|---|---|
-| `--input-path` | ✅ | — | Path to input file or directory (PDF, PNG, JPG, JPEG) or `s3://` URI |
-| `--output-file` | ✅ | — | Output JSONL file path |
-| `--instruction-path` | ✅ | — | YAML file containing task/prompt templates |
-| `--task` | ✅ | — | Dot-separated key into the YAML template (e.g. `ocr.books`) |
-| `--temp-path` | ✅ | — | Directory for temporary PDF files downloaded from S3 (e.g. `/opt/dlami/nvme/myuser`) *ALWAYS KEEP THE NVME PATH*|
-| `--template-fields` | ❌ | — | Record fields to fill into the template (space-separated) |
-| `--spill-path` | ❌ | same dir as output | Path for the disk spill JSONL file (*ONLY REQUIRED IF THE OUTPUT PATH IS NOT IN NVME. MAKE SURE THE SPILL PATH IS IN NVME TO AVOID HITTING YOUR STORAGE QUOTA*) |
+### Configuration Reference
 
-### Model & Backend
-
-| Argument | Required | Default | Description |
-|---|---|---|---|
-| `--backend` | ❌ | `sglang` | Inference backend: `sglang`, `sglang-native`, `sglang-oai`, `sglang-oai-chat`, `vllm`, `vllm-chat`, `lmdeploy`, `lmdeploy-chat`, `trt` |
-| `--model` | ❌ | auto-detect | Model name or path |
-| `--tokenizer` | ❌ | — | Tokenizer name or path |
-
-### Server / Connection
-
-| Argument | Required | Default | Description |
-|---|---|---|---|
-| `--base-url` | ❌ | — | Full base URL (overrides host/port) |
-| `--host` | ❌ | `0.0.0.0` | Server host |
-| `--port` | ❌ | backend default | Server port (sglang: 30000, vllm: 8000, lmdeploy: 23333) |
-
-### Generation
-
-| Argument | Required | Default | Description |
-|---|---|---|---|
-| `--max-new-tokens` | ❌ | — | Max tokens to generate |
-| `--extra-request-body` | ❌ | — | Extra JSON fields for the request payload (e.g. `'{"temperature":0.0}'`) |
-| `--apply-chat-template` | ❌ | `False` | Apply chat template to prompts |
-| `--ignore-eos` | ❌ | `False` | Ignore EOS token during generation |
-
-### Request Control
-
-| Argument | Required | Default | Description |
-|---|---|---|---|
-| `--request-rate` | ❌ | `inf` | Target requests per second (`inf` = unlimited) |
-| `--max-concurrency` | ❌ | `100` | Max concurrent in-flight requests |
-| `--buffer-size` | ❌ | `50` | RAM queue size for prefetched requests |
-| `--enable-stream` | ❌ | `False` | Enable streaming mode |
-
-### PDF Options
-
-| Argument | Required | Default | Description |
-|---|---|---|---|
-| `--pdf-dpi` | ❌ | `200` | DPI for PDF-to-image conversion |
-
-### UX
-
-| Argument | Required | Default | Description |
-|---|---|---|---|
-| `--disable-tqdm` | ❌ | `False` | Disable progress bars |
+| Parameter | Environment Variable | CLI Flag (`server_app.py`) | Recommended on H100 (80GB) | Recommended on A6000 (48GB) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Tensor Parallelism** | `TENSOR_PARALLEL_SIZE` | `--tp-size` | `1` (Single GPU) | `2` (Dual GPU) or `1` (if quantized) |
+| **Context Sequence Length** | `VLLM_MAX_MODEL_LEN` | `--max-model-len` | `8192` or `16384` | `4096` or `8192` |
+| **CUDA Graphs / Eager** | `VLLM_ENFORCE_EAGER` | `--enforce-eager` | `0` (CUDA Graph acceleration) | `0` (with TP=2) or `1` |
+| **Quantization** | `VLLM_QUANTIZATION` | `--quantization` | *(None / bfloat16)* | *(None / `fp8` / `bitsandbytes`)* |
+| **KV Cache Dtype** | `VLLM_KV_CACHE_DTYPE` | `--kv-cache-dtype` | `auto` or `fp8` | `auto` or `fp8` |
+| **GPU Memory Utilization** | `GPU_MEMORY_UTILIZATION` | `--gpu-memory-utilization` | `0.90` | `0.90` – `0.95` |
+| **Pinned GPU ID** | `PINNED_GPU_ID` | `--pinned-gpu` | *(Empty for auto)* | *(Empty for auto)* |
+| **Worker Concurrency** | `API_MAX_CONCURRENT_REQUESTS` | — | `16` | `8` |
 
 ---
 
-## Template YAML Format
+## 🐳 Docker Deployment (`run_docker.sh`)
 
-The `--instruction-path` YAML file contains prompt templates. Use dot-separated keys with `--task` to select the right one.
-
-```yaml
-ocr:
-  books: "Transcribe the text in this image exactly as it appears."
-  receipts: "Extract all line items and totals from this receipt image."
-```
-
-Use `--task ocr.books` to select the first template.
-
-Use `--template-fields` to inject record fields into the template using positional `{}` placeholders:
-
-```yaml
-ocr:
-  books: "Transcribe page {} of file {}."
-```
+The easiest way to start and manage the services is using [`run_docker.sh`](file:///home/mrportable/Documents/kalanjiyam-dots-ocr/run_docker.sh):
 
 ```bash
---template-fields page_num file_path
+# Build and start Gateway + DotsOCR Worker (GPU 0) + Gemma Worker (GPU 1+)
+bash run_docker.sh start
+
+# Check service and GPU statuses
+bash run_docker.sh status
+
+# Tail logs across all containers
+bash run_docker.sh logs
+
+# Cleanly stop all containers
+bash run_docker.sh stop
+
+# Rebuild images without Docker cache
+bash run_docker.sh rebuild
+```
+
+### Customizing Deployments via `.env` or Environment Variables
+
+You can override defaults directly when running docker compose:
+
+```bash
+# Example: Running on an H100 with TP=1 and 16k context
+TENSOR_PARALLEL_SIZE=1 VLLM_MAX_MODEL_LEN=16384 docker compose up -d
+
+# Example: Running on a single A6000 with FP8 quantization
+VLLM_QUANTIZATION=fp8 docker compose up -d
 ```
 
 ---
 
-## S3 Support
+## 💻 Standalone Execution
 
-S3 paths are supported for `--input-path`:
-
-```bash
---input-path s3://my-bucket/path/to/pdfs/
-```
-
-### S3 on EC2
-
-The script uses **path-style S3 URLs** (`s3.amazonaws.com/bucket`) by default, which is required when running on EC2 with a VPC Gateway Endpoint (no NAT gateway). This is handled automatically via `get_s3_client()`.
-
-If you encounter DNS resolution errors for S3, also set this env var to cover any remaining boto3 calls:
+Run `server_app.py` directly without Docker:
 
 ```bash
-export AWS_S3_ADDRESSING_STYLE=path
-```
+# Start DotsOCR on GPU 0
+python server_app.py --port 18887 --engine dots-ocr --pinned-gpu 0
 
-To make it permanent for your user only (does not affect other users on the cluster):
+# Start Gemma-4 on GPU 1 with TP=2 across 2 GPUs
+python server_app.py --port 18888 --engine gemma-4 --tp-size 2 --max-model-len 8192
 
-```bash
-echo 'export AWS_S3_ADDRESSING_STYLE=path' >> ~/.bashrc
-source ~/.bashrc
-```
-
-### Temporary Files (S3 PDFs)
-
-PDFs pulled from S3 are downloaded to `--temp-path` during processing and deleted automatically when the run completes. On a DLAMI EC2 instance, use the NVMe scratch disk:
-
-```bash
---temp-path /opt/dlami/nvme/myuser
-```
-
-If the process is killed before cleanup, remove leftover files safely with:
-
-```bash
-find /tmp -name "*.pdf" -user $(whoami) -delete
-```
-
-Or if using a custom temp path:
-
-```bash
-rm /opt/dlami/nvme/myuser/*.pdf
+# Start Unified Gateway
+python gateway.py
 ```
 
 ---
 
-## Resume / Crash Recovery
+## 📦 Async Batch Inference Pipeline (`async_infer-lazy-buffer_newer_w_s3.py`)
 
-The script tracks completed IDs in the output JSONL file. If the run is interrupted, re-running with the same `--output-file` will automatically skip already-processed items.
-
-The disk spill file is deleted and recreated fresh on each run. Use `--spill-path` to control its location.
-
----
-
-## Output Format
-
-Each line in the output JSONL file is:
-
-```json
-{"id": "filename↳page_num", "generated_text": "..."}
-```
-
-For single images, `id` is the filename. For PDFs, `id` is `filename↳page_number`.
-
----
-
-## Full Example
+For high-throughput offline batch processing across thousands of document pages and PDFs:
 
 ```bash
 python async_infer-lazy-buffer_newer_w_s3.py \
   --input-path s3://my-bucket/pdfs/ \
   --output-file /data/ocr_results.jsonl \
-  --instruction-path /fsxnew/shyam.pawar/inference_scripts/instruction_prompts.yml \
+  --instruction-path instruction_prompts.yml \
   --task dotsocr_w_layout \
   --backend vllm-chat \
-  --model /fsxnew/opensource-models/weights/DotsOCR \
-  --max-concurrency $((NUM_NODES * NUM_GPUS * NUM_REQ_PER_GPU)) \
-  --buffer-size $((NUM_NODES * NUM_GPUS * NUM_REQ_PER_GPU)) \
+  --model /root/.cache/weights/DotsOCR \
+  --max-concurrency 100 \
+  --buffer-size 100 \
   --temp-path /opt/dlami/nvme/myuser \
   --spill-path /opt/dlami/nvme/myuser/spill.jsonl \
-  --extra-request-body '{"temperature": 0.7, "top_p": 0.9, "top_k": 50, "repetition_penalty": 1.2, "min_p": 0.01, "max_tokens": 8192}'
-  --host 10.0.129.167 \
-  --port 20100
+  --host 127.0.0.1 \
+  --port 8887
 ```
+
+### Batch Arguments Reference
+
+| Argument | Required | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--input-path` | ✅ | — | Path to images/PDFs directory or `s3://` URI |
+| `--output-file` | ✅ | — | Output JSONL file path |
+| `--instruction-path` | ✅ | — | YAML file containing task/prompt templates |
+| `--task` | ✅ | — | Dot-separated key in YAML template (e.g. `dotsocr_w_layout`) |
+| `--temp-path` | ✅ | — | NVMe scratch directory for S3 PDF streaming |
+| `--backend` | ❌ | `sglang` | `vllm`, `vllm-chat`, `sglang`, `lmdeploy`, `trt` |
+| `--max-concurrency` | ❌ | `100` | Max concurrent in-flight requests |
+| `--buffer-size` | ❌ | `50` | Prefetch queue size |
+| `--pdf-dpi` | ❌ | `200` | Rendering resolution for PDF conversion |
+
+---
+
+## 📄 License & Contracts
+
+- **OCR Service Contract**: Kalanjiyam OCR Service Contract (v2.1)
+- **Metadata Extraction Contract**: Metadata Extraction API Specification (v1.0)
+- **Base Models**: DotsOCR (`rednote-hilab/dots.ocr`), Google Gemma 4 (`google/gemma-4-26B-A4B-it`)

@@ -90,7 +90,8 @@ DOTSOCR_PROMPT = """please output the layout information from the pdf image, inc
 4. constraints:
     - the output text must be the original text from the image, with no translation.
     - all layout elements must be sorted according to human reading order.
-"""
+
+5. final output: the entire output must be a single json object."""
 
 GEMMA4_OCR_PROMPT = """Extract and transcribe all text from this image with high accuracy, following natural human reading order.
 Do not output template placeholders, repeated phrases, or commentary. Output only the actual text visible in the document.

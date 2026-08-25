@@ -14,7 +14,17 @@ fi
 
 MODEL_HOST_PATH="${HOST_MODEL_PATH:-rednote-hilab/dots.ocr}"
 GEMMA_MODEL_HOST_PATH="${GEMMA4_MODEL_PATH:-google/gemma-4-26B-A4B-it}"
+ENABLE_GEMMA="${ENABLE_GEMMA:-false}"
 ACTION=""
+
+# Parse arguments for flags
+for arg in "$@"; do
+  if [[ "$arg" == "--with-gemma" || "$arg" == "--enable-gemma" ]]; then
+    ENABLE_GEMMA="true"
+  elif [[ "$arg" == "--without-gemma" || "$arg" == "--disable-gemma" ]]; then
+    ENABLE_GEMMA="false"
+  fi
+done
 
 if [[ "$1" =~ ^(start|stop|restart|rebuild|build|logs|status|health|start-single|stop-single|logs-single|start-multi|stop-multi|logs-multi|status-multi)$ ]]; then
   ACTION="$1"
@@ -27,47 +37,67 @@ fi
 
 export HOST_MODEL_PATH="$MODEL_HOST_PATH"
 export GEMMA4_MODEL_PATH="$GEMMA_MODEL_HOST_PATH"
+export ENABLE_GEMMA="$ENABLE_GEMMA"
 
 case "$ACTION" in
   build|rebuild)
     echo "[Docker Manager] Building all container images with --no-cache..."
-    $COMPOSE_CMD build --no-cache
+    $COMPOSE_CMD --profile gemma build --no-cache
     echo "[Docker Manager] Build complete."
     ;;
 
   start)
-    echo "[Docker Manager] Building and starting Gateway + 2 Workers (DotsOCR on GPU 0, Gemma on GPU 1)..."
-    $COMPOSE_CMD up -d --build
-    echo ""
-    echo "======================================================================"
-    echo " [Docker Manager] Unified Service Online at http://localhost:8887"
-    echo "----------------------------------------------------------------------"
-    echo " • OCR Endpoint:      POST http://localhost:8887/v1/ocr"
-    echo " • Metadata Endpoint: POST http://localhost:8887/v1/metadata"
-    echo " • Engines Discovery: GET  http://localhost:8887/v1/engines"
-    echo " • Health Check:      GET  http://localhost:8887/health"
-    echo " • GPU 0: DotsOCR (Port 18887) | GPU 1: Gemma (Port 18888)"
-    echo "======================================================================"
+    if [[ "$ENABLE_GEMMA" == "true" || "$ENABLE_GEMMA" == "1" ]]; then
+      echo "[Docker Manager] Building and starting Gateway + 2 Workers (DotsOCR on GPU 0, Gemma on GPU 1)..."
+      $COMPOSE_CMD --profile gemma up -d --build
+      echo ""
+      echo "======================================================================"
+      echo " [Docker Manager] Unified Service Online at http://localhost:8887"
+      echo "----------------------------------------------------------------------"
+      echo " • OCR Endpoint:      POST http://localhost:8887/v1/ocr"
+      echo " • Metadata Endpoint: POST http://localhost:8887/v1/metadata"
+      echo " • Engines Discovery: GET  http://localhost:8887/v1/engines"
+      echo " • Health Check:      GET  http://localhost:8887/health"
+      echo " • GPU 0: DotsOCR (Port 18887) | GPU 1: Gemma (Port 18888) [ENABLED]"
+      echo "======================================================================"
+    else
+      echo "[Docker Manager] Building and starting Gateway + DotsOCR Worker (GPU 0)..."
+      $COMPOSE_CMD up -d --build
+      echo ""
+      echo "======================================================================"
+      echo " [Docker Manager] Unified Service Online at http://localhost:8887"
+      echo "----------------------------------------------------------------------"
+      echo " • OCR Endpoint:      POST http://localhost:8887/v1/ocr"
+      echo " • Engines Discovery: GET  http://localhost:8887/v1/engines"
+      echo " • Health Check:      GET  http://localhost:8887/health"
+      echo " • GPU 0: DotsOCR Worker (Port 18887)"
+      echo " • Gemma Worker:      DISABLED (Default. Enable with: ENABLE_GEMMA=true bash run_docker.sh start)"
+      echo "======================================================================"
+    fi
     ;;
 
   restart)
-    echo "[Docker Manager] Restarting all services..."
-    $COMPOSE_CMD down
-    $COMPOSE_CMD up -d --build
+    echo "[Docker Manager] Restarting services..."
+    $COMPOSE_CMD --profile gemma down
+    if [[ "$ENABLE_GEMMA" == "true" || "$ENABLE_GEMMA" == "1" ]]; then
+      $COMPOSE_CMD --profile gemma up -d --build
+    else
+      $COMPOSE_CMD up -d --build
+    fi
     ;;
 
   stop)
     echo "[Docker Manager] Stopping all OCR containers and Gateway..."
-    $COMPOSE_CMD down
+    $COMPOSE_CMD --profile gemma down
     ;;
 
   logs)
     echo "[Docker Manager] Fetching logs across all containers..."
-    $COMPOSE_CMD logs -f
+    $COMPOSE_CMD --profile gemma logs -f
     ;;
 
   status|health)
-    $COMPOSE_CMD ps
+    $COMPOSE_CMD --profile gemma ps
     echo ""
     echo "[Health & Engine Status]:"
     curl -s http://localhost:8887/v1/engines | python3 -m json.tool || true
@@ -127,12 +157,12 @@ case "$ACTION" in
     ;;
 
   *)
-    echo "Usage: bash run_docker.sh <command>"
+    echo "Usage: bash run_docker.sh <command> [--with-gemma]"
     echo ""
     echo "Commands:"
-    echo "  start         # Build & start Gateway + DotsOCR Worker + Gemma Worker (docker-compose)"
+    echo "  start         # Build & start Gateway + DotsOCR Worker (pass --with-gemma or ENABLE_GEMMA=true for Gemma worker)"
     echo "  stop          # Stop all compose containers"
-    echo "  restart       # Restart all compose containers"
+    echo "  restart       # Restart compose containers"
     echo "  rebuild       # Rebuild all images with --no-cache"
     echo "  logs          # Tail logs for all compose containers"
     echo "  status        # Check status and engine discovery"
@@ -141,6 +171,10 @@ case "$ACTION" in
     echo "  logs-single   # Tail logs for standalone single-container"
     echo "  start-multi   # 4-GPU DotsOCR dedicated cluster"
     echo "  stop-multi    # Stop 4-GPU DotsOCR dedicated cluster"
+    echo ""
+    echo "Options:"
+    echo "  --with-gemma     # Enable Gemma worker on GPU 1 (default: disabled)"
+    echo "  --without-gemma  # Explicitly disable Gemma worker"
     exit 1
     ;;
 esac

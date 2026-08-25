@@ -412,25 +412,32 @@ def test_api_v1_metadata_endpoint_execution(sample_metadata_request_dict):
         }
     }
 
-    with patch("server_app.gpu_manager.start_backend") as mock_start:
-        mock_start.return_value = {"gpu_idx": 0, "port": 8000, "engine": "gemma-4"}
-        with patch("requests.post") as mock_post:
-            mock_resp = MagicMock()
-            mock_resp.status_code = 200
-            mock_resp.json.return_value = mock_llm_response
-            mock_post.return_value = mock_resp
+    # 1. When Gemma is disabled (default), expect 503
+    resp_disabled = client.post("/v1/metadata", json=sample_metadata_request_dict)
+    assert resp_disabled.status_code == 503
+    assert "disabled" in resp_disabled.json()["detail"].lower()
 
-            response = client.post("/v1/metadata", json=sample_metadata_request_dict)
-            assert response.status_code == 200
-            data = response.json()
-            assert data["contract_version"] == "1.0"
-            assert data["status"] == "success"
-            assert data["engine"] == "gemma-4"
-            assert data["model"]["name"] == "gemma-4-26b-a4b-it"
-            assert data["unit_id"] == "kalanjiyam:project/kalat-1932-17"
-            assert data["window_index"] == 3
-            assert "TITLE" in data["fields"]
-            assert data["fields"]["TITLE"]["value"] == "Grant of an honorary commission"
+    # 2. When Gemma is enabled, expect 200 and successful extraction
+    with patch("server_app.ENABLE_GEMMA", True):
+        with patch("server_app.gpu_manager.start_backend") as mock_start:
+            mock_start.return_value = {"gpu_idx": 0, "port": 8000, "engine": "gemma-4"}
+            with patch("requests.post") as mock_post:
+                mock_resp = MagicMock()
+                mock_resp.status_code = 200
+                mock_resp.json.return_value = mock_llm_response
+                mock_post.return_value = mock_resp
+
+                response = client.post("/v1/metadata", json=sample_metadata_request_dict)
+                assert response.status_code == 200
+                data = response.json()
+                assert data["contract_version"] == "1.0"
+                assert data["status"] == "success"
+                assert data["engine"] == "gemma-4"
+                assert data["model"]["name"] == "gemma-4-26b-a4b-it"
+                assert data["unit_id"] == "kalanjiyam:project/kalat-1932-17"
+                assert data["window_index"] == 3
+                assert "TITLE" in data["fields"]
+                assert data["fields"]["TITLE"]["value"] == "Grant of an honorary commission"
 
 
 def test_api_v1_metadata_error_handling():

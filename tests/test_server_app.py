@@ -216,17 +216,17 @@ def test_string_parsed_layout_fallback():
 
 
 def test_api_v1_ocr_endpoint_schema():
-    """Test FastAPI endpoint discovery and schema."""
+    """Test FastAPI endpoint discovery and schema when Gemma is disabled by default."""
     client = TestClient(app)
 
-    # GET /v1/engines
+    # GET /v1/engines (Gemma disabled by default)
     resp = client.get("/v1/engines")
     assert resp.status_code == 200
     data = resp.json()
     assert data.get("status") == "ok"
     assert "dots-ocr" in data["engines"]
-    assert "gemma-4" in data["engines"]
-    assert "kalanjiyam-archival" in data["engines"]
+    assert "gemma-4" not in data["engines"]
+    assert data["gemma_enabled"] is False
     assert data["default_engine"] in data["engines"]
 
     # Also test /engines alias
@@ -234,8 +234,43 @@ def test_api_v1_ocr_endpoint_schema():
     assert resp_alias.status_code == 200
     assert resp_alias.json().get("status") == "ok"
     assert "dots-ocr" in resp_alias.json()["engines"]
-    assert "gemma-4" in resp_alias.json()["engines"]
-    assert "kalanjiyam-archival" in resp_alias.json()["engines"]
+    assert "gemma-4" not in resp_alias.json()["engines"]
+
+
+def test_api_v1_ocr_endpoint_schema_with_gemma_enabled(monkeypatch):
+    """Test FastAPI endpoint discovery when Gemma is enabled."""
+    import server_app
+    monkeypatch.setattr(server_app, "ENABLE_GEMMA", True)
+    client = TestClient(app)
+
+    resp = client.get("/v1/engines")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data.get("status") == "ok"
+    assert "dots-ocr" in data["engines"]
+    assert "gemma-4" in data["engines"]
+    assert "kalanjiyam-archival" in data["engines"]
+    assert data["gemma_enabled"] is True
+
+
+def test_gemma_disabled_rejections():
+    """Test that requests to Gemma when disabled return clear error responses."""
+    client = TestClient(app)
+    image_bytes = create_dummy_image(100, 100)
+
+    # POST /v1/ocr with engine=gemma-4
+    resp = client.post(
+        "/v1/ocr",
+        files={"file": ("test.jpg", image_bytes, "image/jpeg")},
+        data={"engine": "gemma-4"}
+    )
+    assert resp.status_code == 400
+    assert "disabled" in resp.json()["detail"].lower()
+
+    # GET /health with engine=gemma-4
+    resp_health = client.get("/health?engine=gemma-4")
+    assert resp_health.status_code == 503
+    assert resp_health.json()["status"] == "disabled"
 
 
 def test_engine_resolution():

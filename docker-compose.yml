@@ -34,8 +34,11 @@ services:
               count: all
               capabilities: [gpu]
 
-  # Gemma Worker Service (Dynamic GPU Selection across all 4 GPUs)
+  # Gemma Worker Service (Optional: enabled via --profile gemma or ENABLE_GEMMA=true)
   gemma-worker:
+    profiles:
+      - gemma
+      - all
     build:
       context: .
       dockerfile: Dockerfile.gemma
@@ -54,6 +57,7 @@ services:
       - FASTAPI_PORT=18888
       - VLLM_PORT=18001
       - DEFAULT_ENGINE=gemma-4
+      - ENABLE_GEMMA=true
       - GPU_MEMORY_UTILIZATION=${GEMMA_GPU_MEMORY_UTILIZATION:-0.90}
       - API_MAX_CONCURRENT_REQUESTS=${API_MAX_CONCURRENT_REQUESTS:-8}
       - VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-1}
@@ -88,6 +92,6 @@ services:
       - GATEWAY_PORT=8887
       - DOTSOCR_WORKER_URL=http://127.0.0.1:18887
       - GEMMA_WORKER_URL=http://127.0.0.1:18888
+      - ENABLE_GEMMA=${ENABLE_GEMMA:-false}
     depends_on:
       - dotsocr-worker
-      - gemma-worker

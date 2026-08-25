@@ -67,6 +67,10 @@ MODEL_NAME = "model"
 DEBUG_BBOX = os.getenv("DEBUG_BBOX", "0").lower() in ("1", "true", "yes")
 DEFAULT_ENGINE = os.getenv("DEFAULT_ENGINE", os.getenv("ENGINE", "dots-ocr")).strip().lower()
 DEFAULT_METADATA_ENGINE = os.getenv("DEFAULT_METADATA_ENGINE", "gemma-4").strip().lower()
+ENABLE_GEMMA = os.getenv(
+    "ENABLE_GEMMA",
+    "1" if DEFAULT_ENGINE in ("gemma-4", "kalanjiyam-archival") or "gemma" in DEFAULT_ENGINE else "0"
+).strip().lower() in ("1", "true", "yes", "on")
 
 # Asyncio Semaphore to restrict maximum parallel in-flight OCR requests at API level
 request_semaphore = asyncio.Semaphore(API_MAX_CONCURRENT_REQUESTS)
@@ -167,6 +171,13 @@ ENGINE_CONFIGS = {
         "min_free_vram_mb": _env_int("METADATA_MIN_FREE_VRAM_MB", _env_int("GEMMA4_MIN_FREE_VRAM_MB", 30000)),
     },
 }
+
+
+def get_active_engines() -> list:
+    """Returns list of enabled engine IDs based on ENABLE_GEMMA setting."""
+    if ENABLE_GEMMA:
+        return list(ENGINE_CONFIGS.keys())
+    return [k for k in ENGINE_CONFIGS.keys() if "gemma" not in k and "archival" not in k]
 
 
 def resolve_engine(engine_name: Optional[str]) -> str:
@@ -1711,9 +1722,10 @@ def get_engines():
     """Returns list of active engines for Kalanjiyam service discovery."""
     return {
         "status": "ok",
-        "engines": list(ENGINE_CONFIGS.keys()),
+        "engines": get_active_engines(),
         "current_engine": gpu_manager.current_engine or DEFAULT_ENGINE,
         "default_engine": DEFAULT_ENGINE,
+        "gemma_enabled": ENABLE_GEMMA,
     }
 
 
@@ -1729,7 +1741,8 @@ def gpu_status():
         "backend_running": gpu_manager.is_running(),
         "current_engine": gpu_manager.current_engine,
         "default_engine": DEFAULT_ENGINE,
-        "available_engines": list(ENGINE_CONFIGS.keys()),
+        "available_engines": get_active_engines(),
+        "gemma_enabled": ENABLE_GEMMA,
         "api_max_concurrent_limit": API_MAX_CONCURRENT_REQUESTS,
         "vllm_max_num_seqs": VLLM_MAX_NUM_SEQS,
         "idle_seconds": round(time.time() - gpu_manager.last_active_timestamp, 1),
@@ -1742,6 +1755,17 @@ def gpu_status():
 def health_check(engine: Optional[str] = None):
     """Health check endpoint."""
     target_engine = resolve_engine(engine)
+    if ("gemma" in target_engine or "archival" in target_engine) and not ENABLE_GEMMA:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "disabled",
+                "backend_running": gpu_manager.is_running(),
+                "checked_engine": target_engine,
+                "default_engine": DEFAULT_ENGINE,
+                "error": "Gemma engine is currently disabled (ENABLE_GEMMA=false)."
+            }
+        )
     available = gpu_manager.is_available(target_engine)
     payload = {
         "status": "healthy" if available else "unavailable",
@@ -1754,6 +1778,7 @@ def health_check(engine: Optional[str] = None):
         "api_max_concurrent_limit": API_MAX_CONCURRENT_REQUESTS,
         "vllm_max_num_seqs": VLLM_MAX_NUM_SEQS,
         "min_free_vram_mb": ENGINE_CONFIGS[target_engine]["min_free_vram_mb"],
+        "gemma_enabled": ENABLE_GEMMA,
     }
     return JSONResponse(status_code=200 if available else 503, content=payload)
 
@@ -1781,6 +1806,13 @@ async def run_ocr(
     eff_max_tokens = max_tokens if (max_tokens is not None and max_tokens > 0) else 4096
 
     target_engine = resolve_engine(engine)
+    if ("gemma" in target_engine or "archival" in target_engine) and not ENABLE_GEMMA:
+        log("REQ ERROR", f"Request rejected: Gemma engine '{target_engine}' is disabled (ENABLE_GEMMA=false)")
+        raise HTTPException(
+            status_code=400,
+            detail="Gemma engine is currently disabled. Set ENABLE_GEMMA=true to enable it."
+        )
+
     engine_cfg = ENGINE_CONFIGS[target_engine]
     filename = target_file.filename or "uploaded_image.jpg"
     log("REQ RECEIVED", f"Processing image: '{filename}' (engine: {target_engine}, language: {language or 'sa'}, max_tokens: {eff_max_tokens})")
@@ -1928,6 +1960,13 @@ async def extract_metadata(
 
     target_engine_name = engine or request_data.engine or DEFAULT_METADATA_ENGINE
     target_engine = resolve_engine(target_engine_name)
+    if ("gemma" in target_engine or "archival" in target_engine) and not ENABLE_GEMMA:
+        log("REQ ERROR", f"Metadata request rejected: Engine '{target_engine}' is disabled (ENABLE_GEMMA=false)")
+        raise HTTPException(
+            status_code=503,
+            detail="Archival Metadata extraction is currently disabled because Gemma is disabled. Set ENABLE_GEMMA=true to enable."
+        )
+
     engine_cfg = ENGINE_CONFIGS.get(target_engine, ENGINE_CONFIGS.get("gemma-4", ENGINE_CONFIGS["dots-ocr"]))
 
     win_idx = request_data.window.index if request_data.window else 0
@@ -2012,6 +2051,8 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="0.0.0.0", help="Host address to bind to")
     parser.add_argument("--port", type=int, default=int(os.getenv("FASTAPI_PORT", "8887")), help="Port to run FastAPI service on")
     parser.add_argument("--engine", default=DEFAULT_ENGINE, help="Default OCR engine ('dots-ocr' or 'gemma-4')")
+    parser.add_argument("--enable-gemma", action="store_true", default=False, help="Enable Gemma-4 engine option")
+    parser.add_argument("--disable-gemma", action="store_true", default=False, help="Explicitly disable Gemma-4 engine option")
     parser.add_argument("--model-path", default=None, help="Custom model path override")
     parser.add_argument("--tp-size", "--tensor-parallel-size", type=int, default=None, help="Tensor parallel size (e.g. 1 on H100, 2 on 2x A6000)")
     parser.add_argument("--gpu-memory-utilization", type=float, default=None, help="vLLM GPU memory utilization target (0.1 - 1.0)")
@@ -2022,9 +2063,19 @@ if __name__ == "__main__":
     parser.add_argument("--enforce-eager", action="store_true", default=False, help="Disable CUDA graphs and enforce eager mode")
     args = parser.parse_args()
 
+    if args.enable_gemma:
+        ENABLE_GEMMA = True
+        os.environ["ENABLE_GEMMA"] = "1"
+    elif args.disable_gemma:
+        ENABLE_GEMMA = False
+        os.environ["ENABLE_GEMMA"] = "0"
+
     if args.engine:
         DEFAULT_ENGINE = resolve_engine(args.engine)
         os.environ["DEFAULT_ENGINE"] = DEFAULT_ENGINE
+        if "gemma" in DEFAULT_ENGINE or "archival" in DEFAULT_ENGINE:
+            ENABLE_GEMMA = True
+            os.environ["ENABLE_GEMMA"] = "1"
     if args.model_path:
         MODEL_PATH = args.model_path
         os.environ["MODEL_PATH"] = args.model_path
@@ -2043,5 +2094,5 @@ if __name__ == "__main__":
     if args.enforce_eager:
         os.environ["VLLM_ENFORCE_EAGER"] = "1"
 
-    log("SERVER START", f"Starting OCR API server on {args.host}:{args.port} (default engine: {DEFAULT_ENGINE})...")
+    log("SERVER START", f"Starting OCR API server on {args.host}:{args.port} (default engine: {DEFAULT_ENGINE}, gemma_enabled: {ENABLE_GEMMA})...")
     uvicorn.run("server_app:app", host=args.host, port=args.port, reload=False)

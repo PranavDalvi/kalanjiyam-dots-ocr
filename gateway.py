@@ -6,11 +6,11 @@ from typing import Optional, Dict, Any
 import httpx
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
-import uvicorn
 
 # Worker Backend URLs
 DOTSOCR_WORKER_URL = os.getenv("DOTSOCR_WORKER_URL", "http://127.0.0.1:18887").rstrip("/")
 GEMMA_WORKER_URL = os.getenv("GEMMA_WORKER_URL", "http://127.0.0.1:18888").rstrip("/")
+ENABLE_GEMMA = os.getenv("ENABLE_GEMMA", "false").strip().lower() in ("1", "true", "yes", "on")
 GATEWAY_PORT = int(os.getenv("GATEWAY_PORT") or "8887")
 
 app = FastAPI(
@@ -35,11 +35,16 @@ def resolve_engine_from_string(val: Optional[str]) -> str:
         return "dots-ocr"
     cleaned = str(val).strip().lower()
     if "gemma" in cleaned or "archival" in cleaned or "metadata" in cleaned:
-        return "gemma-4"
+        if ENABLE_GEMMA:
+            return "gemma-4"
+        return "dots-ocr"
     return "dots-ocr"
 
 
 def detect_engine(request: Request, body_bytes: bytes) -> str:
+    if not ENABLE_GEMMA:
+        return "dots-ocr"
+
     # 1. Check path
     path = request.url.path.lower()
     if "/metadata" in path:
@@ -90,7 +95,7 @@ def detect_engine(request: Request, body_bytes: bytes) -> str:
 
 
 def get_worker_url(engine: str) -> str:
-    if engine == "gemma-4":
+    if engine == "gemma-4" and ENABLE_GEMMA:
         return GEMMA_WORKER_URL
     return DOTSOCR_WORKER_URL
 
@@ -145,7 +150,6 @@ async def proxy_request(request: Request, target_base_url: str, body_bytes: byte
 async def get_engines():
     """Aggregates active engines across all backend workers."""
     dots_status = "offline"
-    gemma_status = "offline"
 
     try:
         r = await http_client.get(f"{DOTSOCR_WORKER_URL}/v1/engines", timeout=2.0)
@@ -154,21 +158,28 @@ async def get_engines():
     except Exception:
         pass
 
-    try:
-        r = await http_client.get(f"{GEMMA_WORKER_URL}/v1/engines", timeout=2.0)
-        if r.status_code == 200:
-            gemma_status = "online"
-    except Exception:
-        pass
+    engines = ["dots-ocr"]
+    workers = {
+        "dots-ocr": {"url": DOTSOCR_WORKER_URL, "status": dots_status, "gpu": 0}
+    }
+
+    if ENABLE_GEMMA:
+        gemma_status = "offline"
+        try:
+            r = await http_client.get(f"{GEMMA_WORKER_URL}/v1/engines", timeout=2.0)
+            if r.status_code == 200:
+                gemma_status = "online"
+        except Exception:
+            pass
+        engines.append("gemma-4")
+        workers["gemma-4"] = {"url": GEMMA_WORKER_URL, "status": gemma_status, "gpu": 1}
 
     return {
         "status": "ok",
-        "engines": ["dots-ocr", "gemma-4"],
-        "workers": {
-            "dots-ocr": {"url": DOTSOCR_WORKER_URL, "status": dots_status, "gpu": 0},
-            "gemma-4": {"url": GEMMA_WORKER_URL, "status": gemma_status, "gpu": 1}
-        },
-        "default_engine": "dots-ocr"
+        "engines": engines,
+        "workers": workers,
+        "default_engine": "dots-ocr",
+        "gemma_enabled": ENABLE_GEMMA,
     }
 
 
@@ -176,6 +187,13 @@ async def get_engines():
 async def health_check(engine: Optional[str] = None):
     """Health check for gateway and workers."""
     target_engine = resolve_engine_from_string(engine) if engine else None
+
+    if engine and ("gemma" in engine.lower() or "archival" in engine.lower() or "metadata" in engine.lower()):
+        if not ENABLE_GEMMA:
+            return JSONResponse(
+                status_code=503,
+                content={"status": "disabled", "engine": "gemma-4", "error": "Gemma engine is currently disabled (ENABLE_GEMMA=false)."}
+            )
 
     if target_engine == "dots-ocr":
         try:
@@ -185,6 +203,11 @@ async def health_check(engine: Optional[str] = None):
             return JSONResponse(status_code=503, content={"status": "unavailable", "engine": "dots-ocr", "error": str(e)})
 
     elif target_engine == "gemma-4":
+        if not ENABLE_GEMMA:
+            return JSONResponse(
+                status_code=503,
+                content={"status": "disabled", "engine": "gemma-4", "error": "Gemma engine is currently disabled (ENABLE_GEMMA=false)."}
+            )
         try:
             r = await http_client.get(f"{GEMMA_WORKER_URL}/health", timeout=3.0)
             return JSONResponse(status_code=r.status_code, content=r.json())
@@ -192,30 +215,36 @@ async def health_check(engine: Optional[str] = None):
             return JSONResponse(status_code=503, content={"status": "unavailable", "engine": "gemma-4", "error": str(e)})
 
     else:
-        # Check both workers
+        # Check active workers
         dots_healthy = False
-        gemma_healthy = False
         try:
             r = await http_client.get(f"{DOTSOCR_WORKER_URL}/health", timeout=3.0)
             dots_healthy = (r.status_code == 200)
         except Exception:
             pass
 
-        try:
-            r = await http_client.get(f"{GEMMA_WORKER_URL}/health", timeout=3.0)
-            gemma_healthy = (r.status_code == 200)
-        except Exception:
-            pass
+        workers_status = {
+            "dots-ocr": "healthy" if dots_healthy else "unhealthy"
+        }
 
-        is_healthy = dots_healthy or gemma_healthy
+        if ENABLE_GEMMA:
+            gemma_healthy = False
+            try:
+                r = await http_client.get(f"{GEMMA_WORKER_URL}/health", timeout=3.0)
+                gemma_healthy = (r.status_code == 200)
+            except Exception:
+                pass
+            workers_status["gemma-4"] = "healthy" if gemma_healthy else "unhealthy"
+            is_healthy = dots_healthy or gemma_healthy
+        else:
+            is_healthy = dots_healthy
+
         return JSONResponse(
             status_code=200 if is_healthy else 503,
             content={
                 "status": "healthy" if is_healthy else "unavailable",
-                "workers": {
-                    "dots-ocr": "healthy" if dots_healthy else "unhealthy",
-                    "gemma-4": "healthy" if gemma_healthy else "unhealthy"
-                }
+                "workers": workers_status,
+                "gemma_enabled": ENABLE_GEMMA,
             }
         )
 
@@ -224,7 +253,6 @@ async def health_check(engine: Optional[str] = None):
 async def gpu_status():
     """Queries GPU status from workers."""
     dots_gpu = {}
-    gemma_gpu = {}
     try:
         r = await http_client.get(f"{DOTSOCR_WORKER_URL}/gpu-status", timeout=3.0)
         if r.status_code == 200:
@@ -232,25 +260,34 @@ async def gpu_status():
     except Exception:
         pass
 
-    try:
-        r = await http_client.get(f"{GEMMA_WORKER_URL}/gpu-status", timeout=3.0)
-        if r.status_code == 200:
-            gemma_gpu = r.json()
-    except Exception:
-        pass
-
-    return {
+    payload = {
         "gateway_port": GATEWAY_PORT,
         "dots_worker": dots_gpu,
-        "gemma_worker": gemma_gpu
+        "gemma_enabled": ENABLE_GEMMA,
     }
+
+    if ENABLE_GEMMA:
+        gemma_gpu = {}
+        try:
+            r = await http_client.get(f"{GEMMA_WORKER_URL}/gpu-status", timeout=3.0)
+            if r.status_code == 200:
+                gemma_gpu = r.json()
+        except Exception:
+            pass
+        payload["gemma_worker"] = gemma_gpu
+
+    return payload
 
 
 @app.post("/free-vram")
 async def free_vram():
-    """Frees VRAM across all workers."""
+    """Frees VRAM across all active workers."""
+    workers = [("dots-ocr", DOTSOCR_WORKER_URL)]
+    if ENABLE_GEMMA:
+        workers.append(("gemma-4", GEMMA_WORKER_URL))
+
     results = {}
-    for name, url in [("dots-ocr", DOTSOCR_WORKER_URL), ("gemma-4", GEMMA_WORKER_URL)]:
+    for name, url in workers:
         try:
             r = await http_client.post(f"{url}/free-vram", timeout=5.0)
             results[name] = r.json() if r.status_code == 200 else "failed"
@@ -272,6 +309,11 @@ async def proxy_ocr(request: Request):
 @app.post("/v1/metadata")
 async def proxy_metadata(request: Request):
     """Routes Archival Metadata Extraction requests directly to Gemma worker."""
+    if not ENABLE_GEMMA:
+        raise HTTPException(
+            status_code=503,
+            detail="Gemma / Archival Metadata worker is currently disabled. Set ENABLE_GEMMA=true to enable."
+        )
     body_bytes = await request.body()
     log("ROUTE", f"Routing Metadata request to Gemma worker ({GEMMA_WORKER_URL})...")
     return await proxy_request(request, GEMMA_WORKER_URL, body_bytes)
@@ -287,7 +329,11 @@ async def catch_all(request: Request, path: str):
 
 
 if __name__ == "__main__":
+    import uvicorn
     log("STARTUP", f"Starting Kalanjiyam OCR Unified Gateway on port {GATEWAY_PORT}...")
     log("STARTUP", f"  DotsOCR worker target: {DOTSOCR_WORKER_URL} (GPU 0)")
-    log("STARTUP", f"  Gemma worker target:   {GEMMA_WORKER_URL} (GPU 1)")
+    if ENABLE_GEMMA:
+        log("STARTUP", f"  Gemma worker target:   {GEMMA_WORKER_URL} (GPU 1) [ENABLED]")
+    else:
+        log("STARTUP", f"  Gemma worker:          DISABLED (ENABLE_GEMMA=false)")
     uvicorn.run(app, host="0.0.0.0", port=GATEWAY_PORT, reload=False)

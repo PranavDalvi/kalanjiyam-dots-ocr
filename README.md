@@ -128,8 +128,12 @@ VLLM_QUANTIZATION=bitsandbytes GEMMA4_MAX_MODEL_LEN=4096 bash run_docker.sh star
 The easiest way to start and manage the services is using [`run_docker.sh`](file:///home/mrportable/Documents/kalanjiyam-dots-ocr/run_docker.sh):
 
 ```bash
-# Build and start Gateway + DotsOCR Worker (GPU 0) + Gemma Worker (GPU 1+)
+# Build and start Gateway + DotsOCR Worker (Default: Gemma disabled)
 bash run_docker.sh start
+
+# Start Gateway + DotsOCR Worker + Gemma Worker (GPU 1+)
+ENABLE_GEMMA=true bash run_docker.sh start
+# or: bash run_docker.sh start --with-gemma
 
 # Check service and GPU statuses
 bash run_docker.sh status
@@ -149,14 +153,14 @@ bash run_docker.sh rebuild
 You can prepend environment variables directly to `bash run_docker.sh start`:
 
 ```bash
-# Example 1: Fast Gemma-4 E4B Model on any GPU
-GEMMA4_MODEL_PATH=google/gemma-4-E4B-it bash run_docker.sh start
+# Example 1: Enable Gemma with Fast Gemma-4 E4B Model on GPU 1
+ENABLE_GEMMA=true GEMMA4_MODEL_PATH=google/gemma-4-E4B-it bash run_docker.sh start
 
-# Example 2: Unquantized 26B Model on H100 80GB
-TENSOR_PARALLEL_SIZE=1 VLLM_MAX_MODEL_LEN=16384 bash run_docker.sh start
+# Example 2: Unquantized 26B Model on H100 80GB with Gemma enabled
+ENABLE_GEMMA=true TENSOR_PARALLEL_SIZE=1 VLLM_MAX_MODEL_LEN=16384 bash run_docker.sh start
 
-# Example 3: Quantized 26B Model on Single A6000 48GB
-VLLM_QUANTIZATION=bitsandbytes bash run_docker.sh start
+# Example 3: Quantized 26B Model on Single A6000 48GB with Gemma enabled
+ENABLE_GEMMA=true VLLM_QUANTIZATION=bitsandbytes bash run_docker.sh start
 ```
 
 ---

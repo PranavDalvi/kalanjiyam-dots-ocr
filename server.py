@@ -20,11 +20,20 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="0.0.0.0", help="Host address to bind to")
     parser.add_argument("--port", type=int, default=int(os.getenv("FASTAPI_PORT", "8887")), help="Port to run FastAPI service on")
     parser.add_argument("--engine", default=os.getenv("DEFAULT_ENGINE", os.getenv("ENGINE", "dots-ocr")), help="Default OCR engine ('dots-ocr' or 'gemma-4')")
+    parser.add_argument("--enable-gemma", action="store_true", default=False, help="Enable Gemma-4 engine option")
+    parser.add_argument("--disable-gemma", action="store_true", default=False, help="Explicitly disable Gemma-4 engine option")
     parser.add_argument("--model-path", default=None, help="Custom model path override")
     args = parser.parse_args()
 
+    if args.enable_gemma:
+        os.environ["ENABLE_GEMMA"] = "1"
+    elif args.disable_gemma:
+        os.environ["ENABLE_GEMMA"] = "0"
+
     selected_engine = resolve_engine(args.engine)
     os.environ["DEFAULT_ENGINE"] = selected_engine
+    if "gemma" in selected_engine or "archival" in selected_engine:
+        os.environ["ENABLE_GEMMA"] = "1"
     if args.model_path:
         os.environ["MODEL_PATH"] = args.model_path
 
